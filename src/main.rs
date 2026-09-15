@@ -117,6 +117,38 @@ pub extern "C" fn main(hart_id: usize, dtb: usize) -> ! {
     #[cfg(feature = "shell")]
     {
         // TODO: Lab 0
+        #![allow(dead_code)]
+        loop {
+            kprint!("PKUOS>");
+            use alloc::string::String;
+            // use alloc::string::ToString;
+            let mut s = String::new(); // init the string
+            loop {
+                // convert usize to char
+                let c = char::from_u32(sbi::console_getchar() as u32);
+                // append char to string
+                if let Some(c1) = c {
+                    // kprint!("{}", c2);
+                    s.push(c1);
+                    if c1 == '\n' {
+                        break;
+                    }
+                } else {
+                    kprint!("Your input contains non-unicode character\n");
+                    break;
+                }
+            }
+            let s1 = s.trim_start().trim_end();
+            // kprintln!("{}", s);
+            if s1 == "whoami" {
+                kprint!("2400013168\n");
+            } else if s1 == "exit" {
+                break;
+            } else {
+                kprint!("Invalid command\n");
+            }
+            // break;
+        }
     }
 
     DISKFS.unmount();
