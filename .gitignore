@@ -8,10 +8,10 @@
 #  VSC  #
 #########
 .vscode/*
-.vscode/launch.json
 !.vscode/launch.json
 .codex/*
 */assets/
+reports/
 
 # CARGO #
 #########

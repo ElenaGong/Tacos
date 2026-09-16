@@ -1,6 +1,6 @@
 # Lab 1: Appetizer
 
----
+<!-- --- -->
 
 ## Information
 
@@ -10,11 +10,10 @@ Email: 2400013168@stu.pku.edu.cn
 
 > Please cite any forms of information source that you have consulted during finishing your assignment, except the TacOS documentation, course slides, and course staff.
 
-> QEMU： https://github.com/qemu/qemu\
-> OpenSBI： https://github.com/riscv-software-src/opensbi/tree/master ，特别是 https://github.com/riscv-software-src/opensbi/blob/master/docs/domain_support.md 与 lab0 的问题 B6 相关。\
-> RISCV 文档： https://docs.riscv.org/reference/home/index.html ，从中查询了寄存器的名称和用途。\
-> Rust book： https://doc.rust-lang.org/book/  以及交互式学习网站 https://rust-book.cs.brown.edu/\
-> Rust Documentation： https://doc.rust-lang.org/stable/ 
+QEMU： https://github.com/qemu/qemu\
+OpenSBI： https://github.com/riscv-software-src/opensbi/tree/master ，特别是 https://github.com/riscv-software-src/opensbi/blob/master/docs/domain_support.md 与 lab0 的问题 B6 相关。\
+RISCV 文档： https://docs.riscv.org/reference/home/index.html ，从中查询了寄存器的名称和用途。\
+Rust book： https://doc.rust-lang.org/book/  以及交互式学习网站 https://rust-book.cs.brown.edu/ 和 Rust Documentation： https://doc.rust-lang.org/stable/ 
 
 > With any comments that may help TAs to evaluate your work better, please leave them here
 
@@ -22,7 +21,9 @@ Email: 2400013168@stu.pku.edu.cn
 
 > A1: Put the screenshot of Tacos running example here.
 
-![alt text](assets/0-1-screenshot.png)
+<img src=assets/0-1-screenshot.png width=400>
+
+<!-- ![alt text](assets/0-1-screenshot.png) -->
 
 ## Debugging
 
@@ -32,20 +33,18 @@ Email: 2400013168@stu.pku.edu.cn
 
 > B2: At which physical address is this instruction located?
 
-进入debug之后立刻 `layout asm` 可以看到第一条指令是 `auipc t0, 0x0`，位于地址0x1000。
+进入debug之后立刻 `layout asm` 可以看到第一条指令是 `auipc t0, 0x0`，位于地址0x1000。此时系统尚未开启分页，该地址是 QEMU 启动代码所在的物理地址，因此物理地址就是 0x1000。
 
-![alt text](assets/0-2.png)
-
-对应的物理地址？
+<!-- <img src=assets/0-2.png width=300> -->
 
 
 ### From ZSBL to SBI
 
 > B3: Which address will the ZSBL jump to?
 
-![alt text](assets/0-3.png)
+<!-- <img src=assets/0-3.png width=300> -->
 
-0x80000000
+在程序执行到 `jr t0` 时查看寄存器 `t0` 的值，为0x80000000
 
 ### SBI, kernel and argument passing
 
@@ -55,7 +54,7 @@ Email: 2400013168@stu.pku.edu.cn
 
 > B5: What's the value of `Domain0 Next Address`, `Domain0 Next Arg1`, `Domain0 Next Mode` and `Boot HART ID` in OpenSBI's output?
 
-```
+```text
 Domain0 Next Address      : 0x0000000080200000
 Domain0 Next Arg1         : 0x0000000082200000
 Domain0 Next Mode         : S-mode
@@ -76,7 +75,8 @@ Boot HART ID              : 0
 
 > C1: Put the screenshot of your kernel monitor running example here. (It should show how your kernel shell respond to `whoami`, `exit`, and `other input`.)
 
-![alt text](assets/0-5.png)
+<img src=assets/0-5.png width=300>
+
 
 > C2: Explain how you read and write to the console for the kernel monitor.
 
