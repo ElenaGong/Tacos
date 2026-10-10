@@ -4,11 +4,11 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::arch::global_asm;
 use core::fmt::{self, Debug};
-use core::sync::atomic::{AtomicIsize, AtomicU32, Ordering::SeqCst};
+use core::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 use crate::mem::{kalloc, kfree, PageTable, PG_SIZE};
 use crate::sbi::interrupt;
-use crate::thread::Manager;
+use crate::thread::{current, schedule, Manager};
 use crate::userproc::UserProc;
 
 pub const PRI_DEFAULT: u32 = 31;
@@ -30,7 +30,7 @@ pub struct Thread {
     stack: usize,
     status: Mutex<Status>,
     context: Mutex<Context>,
-    pub priority: AtomicU32,
+    pub priority: Mutex<AtomicU32>,
     pub userproc: Option<UserProc>,
     pub pagetable: Option<Mutex<PageTable>>,
 }
@@ -48,12 +48,12 @@ impl Thread {
         static TID: AtomicIsize = AtomicIsize::new(0);
 
         Thread {
-            tid: TID.fetch_add(1, SeqCst),
+            tid: TID.fetch_add(1, Ordering::SeqCst),
             name,
             stack,
             status: Mutex::new(Status::Ready),
             context: Mutex::new(Context::new(stack, entry)),
-            priority: AtomicU32::new(priority),
+            priority: Mutex::new(AtomicU32::new(priority)),
             userproc,
             pagetable: pagetable.map(Mutex::new),
         }
@@ -73,6 +73,14 @@ impl Thread {
 
     pub fn set_status(&self, status: Status) {
         *self.status.lock() = status;
+    }
+
+    // 获取和设置优先级
+    pub fn priority(&self) -> u32 {
+        (*self.priority.lock()).load(Ordering::Relaxed)
+    }
+    pub fn set_priority(&self, priority: u32) {
+        *self.priority.lock() = AtomicU32::new(priority);
     }
 
     pub fn context(&self) -> *mut Context {
@@ -181,6 +189,12 @@ impl Builder {
         kprintln!("[THREAD] create {:?}", new_thread);
 
         Manager::get().register(new_thread.clone());
+
+        let new_priority = new_thread.priority();
+        let max_priority = current().priority();
+        if new_priority > max_priority {
+            schedule();
+        }
 
         // Off you go
         new_thread

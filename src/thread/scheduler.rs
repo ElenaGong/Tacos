@@ -6,6 +6,7 @@
 //!
 
 pub mod fcfs;
+pub mod mlfq;
 
 use alloc::sync::Arc;
 
@@ -13,7 +14,7 @@ use crate::thread::Thread;
 
 #[cfg(feature = "thread-scheduler-priority")]
 // (Lab1) Your task: priority scheduling
-pub type Scheduler = self::fcfs::Fcfs;
+pub type Scheduler = self::mlfq::MLFQ;
 #[cfg(not(feature = "thread-scheduler-priority"))]
 pub type Scheduler = self::fcfs::Fcfs;
 

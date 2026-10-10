@@ -95,6 +95,9 @@ pub fn wake_up(thread: Arc<Thread>) {
     // 这里的 `thread` 是按值传入的 `Arc<Thread>`，函数结束时它的引用计数自动减一。
     assert_eq!(thread.status(), Status::Blocked);
 
+    let new_priority = thread.priority();
+    let max_priority = current().priority();
+
     // 把状态从 `Blocked` 改成 `Ready`，表示“可以被调度了”。
     thread.set_status(Status::Ready);
 
@@ -109,14 +112,27 @@ pub fn wake_up(thread: Arc<Thread>) {
     // `register` 会移动 `thread`（`Arc` 的所有权转移进队列），所以之后不能再使用这个变量。
     // 表达式结束时锁守卫被丢弃，调度器解锁。此时线程真正回到“可运行”状态。
     Manager::get().scheduler.lock().register(thread);
+
+    if new_priority > max_priority {
+        schedule();
+    }
 }
 
 /// (Lab1) Sets the current thread's priority to a given value
-pub fn set_priority(_priority: u32) {}
+pub fn set_priority(priority: u32) {
+    let current = current();
+    let old_priority: u32 = current.priority();
+    if priority == old_priority {
+        return;
+    } else {
+        current.set_priority(priority);
+        schedule();
+    }
+}
 
 /// (Lab1) Returns the current thread's effective priority.
 pub fn get_priority() -> u32 {
-    0
+    current().priority()
 }
 
 /// (Lab1) Make the current thread sleep for the given ticks.
