@@ -7,6 +7,7 @@ mod syscall;
 use crate::device::{plic, virtio};
 use crate::sbi;
 use crate::thread;
+use crate::thread::manager::Manager;
 use core::arch;
 
 use riscv::register::scause::{Exception::*, Interrupt::*, Trap::*};
@@ -70,6 +71,8 @@ pub extern "C" fn trap_handler(frame: &mut Frame) {
 
         Interrupt(SupervisorTimer) => {
             sbi::timer::tick();
+            // 检查是否有待唤醒进程并唤醒它们
+            Manager::get().check_and_awaken();
             unsafe { riscv::register::sstatus::set_sie() };
             thread::schedule();
         }

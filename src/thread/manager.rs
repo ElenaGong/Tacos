@@ -8,9 +8,11 @@ use core::ops::DerefMut;
 use crate::bootstack;
 use crate::mem::KernelPgTable;
 use crate::sbi::interrupt;
+use crate::sbi::timer::timer_ticks;
 use crate::sync::Lazy;
 use crate::thread::{
-    schedule, switch, Builder, Mutex, Schedule, Scheduler, Status, Thread, MAGIC, PRI_DEFAULT, PRI_MIN
+    schedule, switch, wake_up, Builder, Mutex, Schedule, Scheduler, Status, Thread, MAGIC,
+    PRI_DEFAULT, PRI_MIN,
 };
 
 /* --------------------------------- MANAGER -------------------------------- */
@@ -22,13 +24,23 @@ pub struct Manager {
     pub current: Mutex<Arc<Thread>>,
     /// All alive and not yet destroyed threads
     all: Mutex<Vec<Arc<Thread>>>,
+    // Sleeping and not yet awakened threads
+    // TODO: Upgrade to BTreeMap
+    sleeping: Mutex<Vec<(i64, Arc<Thread>)>>,
 }
 
 impl Manager {
     pub fn get() -> &'static Self {
         static TMANAGER: Lazy<Manager> = Lazy::new(|| {
             // Manully create initial thread.
-            let initial = Arc::new(Thread::new("Initial", bootstack as usize, PRI_DEFAULT, 0, None, None));
+            let initial = Arc::new(Thread::new(
+                "Initial",
+                bootstack as usize,
+                PRI_DEFAULT,
+                0,
+                None,
+                None,
+            ));
             unsafe { (bootstack as *mut usize).write(MAGIC) };
             initial.set_status(Status::Running);
 
@@ -36,6 +48,7 @@ impl Manager {
                 scheduler: Mutex::new(Scheduler::default()),
                 all: Mutex::new(Vec::from([initial.clone()])),
                 current: Mutex::new(initial),
+                sleeping: Mutex::new(Vec::new()), // initial sleeping queue is empty
             };
 
             let idle = Builder::new(|| loop {
@@ -60,6 +73,26 @@ impl Manager {
         self.all.lock().push(thread.clone());
     }
 
+    pub fn register_sleeping(&self, tup: (i64, Arc<Thread>)) {
+        // Register thread into sleeping
+        self.sleeping.lock().push(tup);
+    }
+
+    pub fn check_and_awaken(&self) {
+        // TODO: Upgrade to BTreeMap
+        let cur_tick = timer_ticks();
+        // 先在关闭中断（lock()）的状态下把待唤醒线程移动到新队列
+        let to_be_awakened: Vec<(i64, Arc<Thread>)> = self
+            .sleeping
+            .lock()
+            .extract_if(.., |tup| tup.0 <= cur_tick)
+            .collect();
+        // 再唤醒
+        for (_deadline, thread) in to_be_awakened.iter() {
+            wake_up(thread.clone());
+        }
+    }
+
     /// Choose a `ready` thread to run if possible. If found, do as follows:
     ///
     /// 1. Turn off intr. Mark the `next` thread as [`Running`](Status::Running) and
@@ -80,7 +113,10 @@ impl Manager {
             self.current.lock().status() == Status::Running || next.is_some(),
             "no thread is ready"
         );
-        assert!(!self.current.lock().overflow(), "Current thread has overflowed its stack.");
+        assert!(
+            !self.current.lock().overflow(),
+            "Current thread has overflowed its stack."
+        );
 
         if let Some(next) = next {
             assert_eq!(next.status(), Status::Ready);
