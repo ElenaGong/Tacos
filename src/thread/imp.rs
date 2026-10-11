@@ -1,14 +1,16 @@
 //! Implementation of kernel threads
 
+use crate::sync::sleep::SleepInner;
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::fmt::{self, Debug};
 use core::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 use crate::mem::{kalloc, kfree, PageTable, PG_SIZE};
 use crate::sbi::interrupt;
-use crate::thread::{current, schedule, Manager};
+use crate::thread::{current, schedule, Manager, Schedule};
 use crate::userproc::UserProc;
 
 pub const PRI_DEFAULT: u32 = 31;
@@ -30,7 +32,11 @@ pub struct Thread {
     stack: usize,
     status: Mutex<Status>,
     context: Mutex<Context>,
-    pub priority: Mutex<AtomicU32>,
+    // TODO
+    pub base_priority: AtomicU32,
+    pub effective_priority: AtomicU32,
+    pub(crate) waiting_on: Mutex<Option<Weak<SleepInner>>>,
+    pub(crate) held_locks: Mutex<Vec<Weak<SleepInner>>>,
     pub userproc: Option<UserProc>,
     pub pagetable: Option<Mutex<PageTable>>,
 }
@@ -53,7 +59,10 @@ impl Thread {
             stack,
             status: Mutex::new(Status::Ready),
             context: Mutex::new(Context::new(stack, entry)),
-            priority: Mutex::new(AtomicU32::new(priority)),
+            base_priority: AtomicU32::new(priority),
+            effective_priority: AtomicU32::new(priority),
+            waiting_on: Mutex::new(None),
+            held_locks: Mutex::new(Vec::new()),
             userproc,
             pagetable: pagetable.map(Mutex::new),
         }
@@ -77,10 +86,25 @@ impl Thread {
 
     // 获取和设置优先级
     pub fn priority(&self) -> u32 {
-        (*self.priority.lock()).load(Ordering::Relaxed)
+        // TODO done
+        self.effective_priority.load(Ordering::Relaxed)
     }
     pub fn set_priority(&self, priority: u32) {
-        *self.priority.lock() = AtomicU32::new(priority);
+        // TODO: 改为base_priority done
+        self.base_priority.store(priority, Ordering::Relaxed);
+    }
+
+    // TODO: 重新计算优先级 done
+    pub fn recalculate_priority(&self) -> bool {
+        let mut priority = self.base_priority.load(Ordering::Relaxed);
+
+        for lock in self.held_locks.lock().iter().filter_map(Weak::upgrade) {
+            for waiter in lock.waiters.borrow().iter() {
+                priority = priority.max(waiter.priority());
+            }
+        }
+
+        self.effective_priority.swap(priority, Ordering::Relaxed) != priority
     }
 
     pub fn context(&self) -> *mut Context {
@@ -114,7 +138,46 @@ impl Drop for Thread {
         }
     }
 }
+pub fn propagate_priority_from(start: Arc<Thread>) {
+    let old = interrupt::set(false);
+    let mut current = Some(start);
+    let mut visited = Vec::new();
 
+    while let Some(thread) = current {
+        // 防止循环等待导致无限传播
+        if visited.contains(&thread.id()) {
+            break;
+        }
+        visited.push(thread.id());
+
+        let old_priority = thread.priority();
+        let changed = thread.recalculate_priority();
+
+        // 如果 Ready 线程的优先级发生变化，
+        // 必须更新它在优先级就绪队列中的位置
+        if changed && thread.status() == Status::Ready {
+            Manager::get()
+                .scheduler
+                .lock()
+                .reprioritize(thread.clone(), old_priority);
+        }
+
+        if changed == false {
+            break;
+        }
+
+        // 如果当前线程还在等待另一把锁，
+        // 就继续向那把锁的 holder 传播
+        current = thread
+            .waiting_on
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|lock| lock.holder.borrow().clone());
+    }
+
+    interrupt::set(old);
+}
 /* --------------------------------- BUILDER -------------------------------- */
 pub struct Builder {
     priority: u32,

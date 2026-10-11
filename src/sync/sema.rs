@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 
@@ -16,8 +16,8 @@ use crate::thread::{self, Thread};
 #[derive(Clone)]
 pub struct Semaphore {
     value: Cell<usize>,
-    // waiters也和Ready状态的线程一样用多级优先级队列存取
-    waiters: RefCell<BTreeMap<u32, VecDeque<Arc<Thread>>>>,
+    // // waiters也和Ready状态的线程一样用多级优先级队列存取
+    waiters: RefCell<VecDeque<Arc<Thread>>>,
 }
 
 // 手写 Sync/Send 的依据：所有读写都在关中断的临界区内完成，
@@ -32,7 +32,7 @@ impl Semaphore {
         Semaphore {
             value: Cell::new(n),
             // TODO done
-            waiters: RefCell::new(BTreeMap::new()),
+            waiters: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -45,14 +45,7 @@ impl Semaphore {
             // `push_front` ensures to wake up threads in a fifo manner
             // 先登记自己，再阻塞
             // TODO done
-            let current = thread::current();
-            let priority = current.priority();
-            self.waiters
-                .borrow_mut()
-                .entry(priority)
-                .or_insert(VecDeque::new())
-                .push_front(current);
-            // self.waiters.borrow_mut().push_front(thread::current());
+            self.waiters.borrow_mut().push_front(thread::current());
 
             // Block the current thread until it's awakened by an `up` operation
             // 阻塞自己；被唤醒后回到 while 顶部重新判断
@@ -66,21 +59,25 @@ impl Semaphore {
     /// V operation
     pub fn up(&self) {
         let old = sbi::interrupt::set(false);
-        let count = self.value.replace(self.value() + 1);
+        self.value.replace(self.value() + 1);
 
         // Check if we need to wake up a sleeping waiter
         // 唤醒优先级最高的那个
-        let mut to_be_awakened: Option<Arc<Thread>> = None;
-        if let Some(mut entry) = self.waiters.borrow_mut().last_entry() {
-            // 旧值为 0，才说明确实有等待者
-            assert_eq!(count, 0);
+        let to_be_awakened = {
+            let mut q = self.waiters.borrow_mut();
+            let mut best = None;
+            let mut best_priority = 0;
 
-            to_be_awakened = entry.get_mut().pop_back();
-            if entry.get().is_empty() {
-                entry.remove_entry();
+            for (i, thread) in q.iter().enumerate() {
+                let p = thread.priority();
+
+                if best.is_none() || p > best_priority {
+                    best = Some(i);
+                    best_priority = p;
+                }
             }
-        }
-        // clone 是因为 wake_up 要拿走所有权
+            best.and_then(|i| q.remove(i))
+        };
         if let Some(to_be_awakened) = to_be_awakened {
             thread::wake_up(to_be_awakened.clone());
         }

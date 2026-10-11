@@ -15,4 +15,8 @@ impl Schedule for Fcfs {
     fn schedule(&mut self) -> Option<Arc<Thread>> {
         self.0.pop_back()
     }
+
+    fn reprioritize(&mut self, _thread: Arc<Thread>, _old_pri: u32) {
+        return;
+    }
 }

@@ -45,4 +45,18 @@ impl Schedule for MLFQ {
             },
         }
     }
+
+    fn reprioritize(&mut self, thread: Arc<Thread>, old_pri: u32) {
+        let old_queue = self.0.get_mut(&old_pri);
+        // 从旧队列中删除这项
+        if let Some(old_queue) = old_queue {
+            old_queue.retain(|t| Arc::ptr_eq(t, &thread) == false);
+            if old_queue.is_empty() {
+                self.0.remove(&old_pri);
+            }
+        }
+
+        // 放入新队列
+        self.register(thread);
+    }
 }
