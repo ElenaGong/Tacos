@@ -13,7 +13,6 @@ impl Schedule for MLFQ {
         (self.0.entry(thread.priority()).or_insert(VecDeque::new())).push_front(thread);
     }
     fn schedule(&mut self) -> Option<Arc<Thread>> {
-        //
         let current = current();
         let caller_priority = current.priority();
         let caller_status = current.status();

@@ -121,11 +121,11 @@ pub fn wake_up(thread: Arc<Thread>) {
 /// (Lab1) Sets the current thread's priority to a given value
 pub fn set_priority(priority: u32) {
     assert!(priority <= PRI_MAX);
+    let old = interrupt::set(false);
     let current = current();
-    // let old_priority: u32 = current.priority();
-
     current.set_priority(priority);
     propagate_priority_from(current);
+    interrupt::set(old);
     schedule();
 }
 

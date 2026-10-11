@@ -31,7 +31,6 @@ impl Semaphore {
     pub const fn new(n: usize) -> Self {
         Semaphore {
             value: Cell::new(n),
-            // TODO done
             waiters: RefCell::new(VecDeque::new()),
         }
     }
@@ -43,12 +42,9 @@ impl Semaphore {
         // Is semaphore available?
         while self.value() == 0 {
             // `push_front` ensures to wake up threads in a fifo manner
-            // 先登记自己，再阻塞
-            // TODO done
             self.waiters.borrow_mut().push_front(thread::current());
 
             // Block the current thread until it's awakened by an `up` operation
-            // 阻塞自己；被唤醒后回到 while 顶部重新判断
             thread::block();
         }
         self.value.set(self.value() - 1);

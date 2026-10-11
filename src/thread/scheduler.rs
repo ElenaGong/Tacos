@@ -28,5 +28,7 @@ pub trait Schedule: Default {
     /// the current thread.
     fn schedule(&mut self) -> Option<Arc<Thread>>;
 
+    /// When a thread's priority has been modified, reprioritize it to the correct
+    /// priority queue (for Fcfs, do nothing).
     fn reprioritize(&mut self, thread: Arc<Thread>, old_pri: u32);
 }
