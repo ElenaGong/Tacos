@@ -3,16 +3,21 @@
 
 mod load;
 
+use crate::fs::File;
+use crate::mem::pagetable::KernelPgTable;
+use crate::mem::pagetable::PageTable;
+use crate::mem::PG_SIZE;
+use crate::sbi::shutdown;
+use crate::thread::{self, current, TaskStruct};
+use crate::trap::{trap_exit_u, Frame};
+
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::mem::MaybeUninit;
+use core::sync::atomic::Ordering;
 use riscv::register::sstatus;
-
-use crate::fs::File;
-use crate::mem::pagetable::KernelPgTable;
-use crate::thread;
-use crate::trap::{trap_exit_u, Frame};
 
 pub struct UserProc {
     #[allow(dead_code)]
@@ -23,6 +28,41 @@ impl UserProc {
     pub fn new(file: File) -> Self {
         Self { bin: file }
     }
+}
+
+/// 将内核数据写入指定页表对应的用户虚拟地址。
+fn copy_to_new_user(pt: &PageTable, user_dst: usize, src: &[u8]) -> Option<()> {
+    // 检查地址范围是否溢出
+    user_dst.checked_add(src.len())?;
+
+    let mut offset = 0;
+
+    while offset < src.len() {
+        let va = user_dst.checked_add(offset)?;
+
+        // 查询新进程页表
+        let pte = pt.get_pte(va)?;
+
+        // 必须是有效、用户可写的数据页
+        if !pte.is_valid() || !pte.is_leaf() || !pte.is_user() || !pte.is_rwable() {
+            return None;
+        }
+
+        // 计算页内偏移和本次复制长度
+        let page_offset = va & (PG_SIZE - 1);
+        let n = (PG_SIZE - page_offset).min(src.len() - offset);
+
+        // 物理页转成内核可以访问的虚拟地址
+        let kernel_addr = pte.pa().into_va().checked_add(page_offset)?;
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr().add(offset), kernel_addr as *mut u8, n);
+        }
+
+        offset += n;
+    }
+
+    Some(())
 }
 
 /// Execute an object file with arguments.
@@ -60,20 +100,128 @@ pub fn execute(mut file: File, argv: Vec<String>) -> isize {
     // Here the new process will be created.
     let userproc = UserProc::new(file);
 
-    // TODO: (Lab2) Pass arguments to user program
+    // ---------- (Lab2) Pass arguments to user program ------------
+    let stack_top = exec_info.init_sp;
+    let stack_bottom = stack_top - PG_SIZE;
+    let mut cursor = stack_top;
 
-    thread::Builder::new(move || start(frame))
+    // 把单词推到栈上，记录每个词的首地址指针
+    let mut addrs: Vec<usize> = Vec::new();
+
+    let stack_result = (|| -> Option<()> {
+        for s in argv.iter() {
+            // C字符串中不能出现内部的 NUL
+            if s.as_bytes().contains(&0) {
+                return None;
+            }
+            let len = s.len().checked_add(1)?;
+            cursor = cursor.checked_sub(len)?;
+
+            // 防止越界
+            if cursor < stack_bottom {
+                return None;
+            }
+
+            copy_to_new_user(&pt, cursor, s.as_bytes())?;
+            copy_to_new_user(&pt, cursor + s.len(), &[0u8])?;
+
+            addrs.push(cursor);
+        }
+        // 按 8 字节对齐
+        cursor &= !7usize;
+
+        // 为 argv 指针数组预留空间
+        // let pointer_count = argv.len().checked_add(1)?;
+        // let pointer_bytes = pointer_count.checked_mul(8)?;
+        cursor -= 8 * (argv.len() + 1);
+
+        // argv[0] 的用户虚拟地址
+        let argv_ptr = cursor;
+
+        // 按 argv 原来的顺序写入指针
+        for (i, &addr) in addrs.iter().enumerate() {
+            let offset = i.checked_mul(core::mem::size_of::<usize>())?;
+            let slot = argv_ptr.checked_add(offset)?;
+            copy_to_new_user(&pt, slot, &addr.to_ne_bytes())?;
+        }
+        // 写入 argv[argc] = NULL
+        let null_slot =
+            argv_ptr.checked_add(argv.len().checked_mul(core::mem::size_of::<usize>())?)?;
+
+        copy_to_new_user(&pt, null_slot, &0usize.to_ne_bytes())?;
+
+        // 最终栈指针对齐到16字节
+        cursor &= !15usize;
+        if cursor < stack_bottom {
+            return None;
+        }
+
+        // 设置用户态寄存器
+        frame.x[2] = cursor; // sp
+        frame.x[10] = argv.len(); // a0 = argc
+        frame.x[11] = argv_ptr; // a1 = argv
+        Some(())
+    })();
+
+    if stack_result.is_none() {
+        unsafe {
+            pt.destroy();
+        }
+        return -1;
+    }
+
+    // 建立父子任务关系
+    let parent = Arc::clone(&current().task);
+    let child = Arc::new(TaskStruct::child(&parent));
+    let child_for_thread = Arc::clone(&child);
+
+    let new_thread = thread::Builder::new(move || start(frame))
         .pagetable(pt)
         .userproc(userproc)
-        .spawn()
-        .id()
+        .task(child_for_thread)
+        .spawn();
+
+    let tid = new_thread.id();
+
+    child.tid.store(tid, Ordering::Release);
+
+    // 登记子任务到parent
+    parent.children.lock().push(child);
+
+    tid
 }
 
 /// Exits a process.
 ///
 /// Panic if the current thread doesn't own a user process.
-pub fn exit(_value: isize) -> ! {
-    // TODO: Lab2.
+pub fn exit(value: isize) -> ! {
+    // 检查是否拥有用户进程
+    let current = thread::current();
+    let _proc = current
+        .userproc
+        .as_ref()
+        .expect("Current thread has no user process");
+
+    let task = Arc::clone(&current.task);
+    drop(current);
+
+    // 父进程退出时，不再保留对子进程的强引用
+    task.children.lock().clear();
+
+    // 写入退出状态
+    {
+        let mut status = task.exit_status.lock();
+        assert!(status.is_none(), "Process exited twice");
+        *status = Some(value);
+    }
+    // 让 status 在右花括号处析构，把锁释放掉
+
+    // 唤醒等待者
+    task.done.up();
+
+    // 退出
+    drop(task);
+
     thread::exit();
 }
 
@@ -82,9 +230,30 @@ pub fn exit(_value: isize) -> ! {
 /// ## Return
 /// - `Some(exit_value)`
 /// - `None`: if tid was not created by the current thread.
-pub fn wait(_tid: isize) -> Option<isize> {
-    // TODO: Lab2.
-    Some(-1)
+pub fn wait(tid: isize) -> Option<isize> {
+    let current = Arc::clone(&current().task);
+
+    // 找到所需的子进程
+    let child = {
+        let mut children = current.children.lock();
+        let index = children
+            .iter()
+            .position(|child| child.tid.load(Ordering::Acquire) == tid)?;
+
+        // 把 Arc<TaskStruct> 从 children 中取出来，交给局部变量 child
+        children.remove(index)
+    };
+
+    // 等待锁
+    child.done.down();
+
+    // 子进程退出后获取其退出状态
+    let status = *child.exit_status.lock();
+    status
+}
+
+pub fn halt() -> ! {
+    shutdown();
 }
 
 /// Initializes a user process in current thread.

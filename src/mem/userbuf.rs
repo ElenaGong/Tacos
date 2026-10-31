@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 
-use core::arch::global_asm;
-
 use crate::error::OsError;
 use crate::mem::in_kernel_space;
 use crate::Result;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::arch::global_asm;
 
 /// Read a single byte from user space.
 ///
@@ -16,8 +17,8 @@ fn read_user_byte(user_src: *const u8) -> Result<u8> {
         return Err(OsError::BadPtr);
     }
 
-    let byte: u8 = 0;
-    let ret_status: u8 = unsafe { __knrl_read_usr_byte(user_src, &byte as *const u8) };
+    let mut byte: u8 = 0;
+    let ret_status: u8 = unsafe { __knrl_read_usr_byte(user_src, &mut byte) };
 
     if ret_status == 0 {
         Ok(byte)
@@ -45,8 +46,73 @@ fn write_user_byte(user_src: *const u8, value: u8) -> Result<()> {
     }
 }
 
+/// 实现用户内存访问
+///
+/// # copy_from_user
+/// ## Args
+/// - user_src：用户态虚拟地址。
+/// - dst：内核缓冲区，长度由 dst.len() 决定。
+/// ## Return
+/// - Ok(())：复制成功。
+/// - Err(())：地址无效或权限检查失败。
+pub fn copy_from_user(user_src: *const u8, dst: &mut [u8]) -> Result<()> {
+    for (i, byte) in dst.iter_mut().enumerate() {
+        let addr = (user_src as usize).checked_add(i).ok_or(OsError::BadPtr)? as *const u8;
+        *byte = read_user_byte(addr)?;
+    }
+    Ok(())
+}
+
+/// # copy_to_user
+/// ## Args
+/// - user_dst: 用户态虚拟地址
+/// - src：内核缓冲区地址
+/// ## Return
+/// - Ok(())
+/// - Err(())
+pub fn copy_to_user(user_dst: *const u8, src: &[u8]) -> Result<()> {
+    for (i, &byte) in src.iter().enumerate() {
+        let addr = (user_dst as usize).checked_add(i).ok_or(OsError::BadPtr)? as *const u8;
+        write_user_byte(addr, byte)?;
+    }
+    Ok(())
+}
+
+const MAX_LENGTH: usize = 4096;
+
+/// # read_user_cstr
+/// 读取以'\0'结尾的用户态C字符串。最多读取4096字节。
+/// ## Args
+/// - addr (usize): 用户地址空间中的地址
+/// ## Return
+/// - Some(String)
+/// - None
+pub fn read_user_cstr(addr: usize) -> Option<String> {
+    if addr == 0 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+
+    for i in 0..MAX_LENGTH {
+        // 读一个字节到byte
+        let mut byte = [0u8; 1];
+        let byte_addr = addr.checked_add(i)?;
+        copy_from_user(byte_addr as *const u8, &mut byte).ok()?;
+
+        // 如果当前byte为\0，就停止读取并返回
+        if byte[0] == 0 {
+            return String::from_utf8(bytes).ok();
+        }
+
+        // 加到bytes末尾
+        bytes.push(byte[0]);
+    }
+    None
+}
+
 extern "C" {
-    pub fn __knrl_read_usr_byte(user_src: *const u8, byte_ptr: *const u8) -> u8;
+    // FIX: byte_ptr should be mutable
+    pub fn __knrl_read_usr_byte(user_src: *const u8, byte_ptr: *mut u8) -> u8;
     pub fn __knrl_read_usr_byte_pc();
     pub fn __knrl_read_usr_exit();
     pub fn __knrl_write_usr_byte(user_src: *const u8, value: u8) -> u8;

@@ -1,6 +1,7 @@
 //! Implementation of kernel threads
 
 use crate::sync::sleep::SleepInner;
+use crate::sync::Semaphore;
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -24,6 +25,40 @@ pub const MAGIC: usize = 0xdeadbeef;
 pub type Mutex<T> = crate::sync::Mutex<T, crate::sync::Intr>;
 
 /* --------------------------------- Thread --------------------------------- */
+
+/// # TaskStruct
+/// 一个线程的任务上下文，保存parent, children等信息，
+/// 用于exit，wait等。
+pub struct TaskStruct {
+    pub tid: AtomicIsize,
+    pub parent: Option<Weak<TaskStruct>>,      // 弱引用
+    pub children: Mutex<Vec<Arc<TaskStruct>>>, // 强引用
+    pub exit_status: Mutex<Option<isize>>,     // 自身退出码
+    pub done: Semaphore,
+}
+
+impl TaskStruct {
+    pub fn root() -> Self {
+        TaskStruct {
+            tid: AtomicIsize::new(-1),
+            parent: None,
+            children: Mutex::new(Vec::new()),
+            exit_status: Mutex::new(None),
+            done: Semaphore::new(0),
+        }
+    }
+
+    pub fn child(parent: &Arc<TaskStruct>) -> Self {
+        TaskStruct {
+            tid: AtomicIsize::new(-1),
+            parent: Some(Arc::downgrade(parent)),
+            children: Mutex::new(Vec::new()),
+            exit_status: Mutex::new(None),
+            done: Semaphore::new(0),
+        }
+    }
+}
+
 /// All data of a kernel thread
 #[repr(C)]
 pub struct Thread {
@@ -32,13 +67,14 @@ pub struct Thread {
     stack: usize,
     status: Mutex<Status>,
     context: Mutex<Context>,
-    // TODO
     pub base_priority: AtomicU32,
     pub effective_priority: AtomicU32,
     pub(crate) waiting_on: Mutex<Option<Weak<SleepInner>>>,
     pub(crate) held_locks: Mutex<Vec<Weak<SleepInner>>>,
     pub userproc: Option<UserProc>,
     pub pagetable: Option<Mutex<PageTable>>,
+    // 任务上下文
+    pub task: Arc<TaskStruct>,
 }
 
 impl Thread {
@@ -49,6 +85,7 @@ impl Thread {
         entry: usize,
         userproc: Option<UserProc>,
         pagetable: Option<PageTable>,
+        task: Arc<TaskStruct>,
     ) -> Self {
         /// The next thread's id
         static TID: AtomicIsize = AtomicIsize::new(0);
@@ -65,6 +102,7 @@ impl Thread {
             held_locks: Mutex::new(Vec::new()),
             userproc,
             pagetable: pagetable.map(Mutex::new),
+            task: task,
         }
     }
 
@@ -86,15 +124,13 @@ impl Thread {
 
     // 获取和设置优先级
     pub fn priority(&self) -> u32 {
-        // TODO done
         self.effective_priority.load(Ordering::Relaxed)
     }
     pub fn set_priority(&self, priority: u32) {
-        // TODO: 改为base_priority done
         self.base_priority.store(priority, Ordering::Relaxed);
     }
 
-    // TODO: 重新计算优先级 done
+    // 重新计算优先级
     pub fn recalculate_priority(&self) -> bool {
         let mut priority = self.base_priority.load(Ordering::Relaxed);
 
@@ -185,6 +221,7 @@ pub struct Builder {
     function: usize,
     userproc: Option<UserProc>,
     pagetable: Option<PageTable>,
+    task: Option<Arc<TaskStruct>>,
 }
 
 impl Builder {
@@ -201,6 +238,7 @@ impl Builder {
             function: function as usize,
             userproc: None,
             pagetable: None,
+            task: None,
         }
     }
 
@@ -224,8 +262,14 @@ impl Builder {
         self
     }
 
+    pub fn task(mut self, task: Arc<TaskStruct>) -> Self {
+        self.task = Some(task);
+        self
+    }
+
     pub fn build(self) -> Arc<Thread> {
         let stack = kalloc(STACK_SIZE, STACK_ALIGN) as usize;
+        let task = self.task.unwrap_or_else(|| Arc::new(TaskStruct::root()));
 
         // Put magic number at the bottom of the stack.
         unsafe { (stack as *mut usize).write(MAGIC) };
@@ -237,6 +281,7 @@ impl Builder {
             self.function,
             self.userproc,
             self.pagetable,
+            task,
         ))
     }
 

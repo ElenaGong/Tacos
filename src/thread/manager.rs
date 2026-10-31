@@ -11,8 +11,8 @@ use crate::sbi::interrupt;
 use crate::sbi::timer::timer_ticks;
 use crate::sync::Lazy;
 use crate::thread::{
-    schedule, switch, wake_up, Builder, Mutex, Schedule, Scheduler, Status, Thread, MAGIC,
-    PRI_DEFAULT, PRI_MIN,
+    schedule, switch, wake_up, Builder, Mutex, Schedule, Scheduler, Status, TaskStruct, Thread,
+    MAGIC, PRI_DEFAULT, PRI_MIN,
 };
 
 /* --------------------------------- MANAGER -------------------------------- */
@@ -33,6 +33,7 @@ impl Manager {
     pub fn get() -> &'static Self {
         static TMANAGER: Lazy<Manager> = Lazy::new(|| {
             // Manully create initial thread.
+            let task = Arc::new(TaskStruct::root());
             let initial = Arc::new(Thread::new(
                 "Initial",
                 bootstack as usize,
@@ -40,6 +41,7 @@ impl Manager {
                 0,
                 None,
                 None,
+                task,
             ));
             unsafe { (bootstack as *mut usize).write(MAGIC) };
             initial.set_status(Status::Running);
