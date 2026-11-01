@@ -3,10 +3,14 @@
 
 #![allow(dead_code)]
 use crate::fs::disk::DISKFS;
-use crate::mem::userbuf::read_user_cstr;
+use crate::fs::File;
+use crate::mem::userbuf::{copy_to_user, read_user_cstr};
 use crate::sbi::console::stdout;
+use crate::sbi::console_getchar;
+use crate::thread::current;
+use crate::{OsError, Result};
+
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use fs::FileSys;
@@ -18,7 +22,7 @@ const MAX_ARG_BYTES: usize = 3072;
 /*                               SYSCALL NUMBER                               */
 /* -------------------------------------------------------------------------- */
 
-use crate::userproc::{execute, exit, halt, wait};
+use crate::userproc::{execute, exit, halt, wait, OpenFile};
 use crate::{mem::userbuf::copy_from_user, sbi::console_putchar};
 
 const SYS_HALT: usize = 1;
@@ -38,33 +42,233 @@ const SYS_FSTAT: usize = 12;
 /*                             SYSCALL FUNCTIONS                              */
 /* -------------------------------------------------------------------------- */
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+fn sys_open(pathname: *const u8, mode: Mode, create: bool, trunc: bool) -> isize {
+    let Some(path) = read_user_cstr(pathname as usize) else {
+        return -1;
+    };
+    // 空路径不是合法文件名
+    if path.is_empty() {
+        return -1;
+    }
+
+    // 允许create就直接走sys_create（包含打开已有文件的逻辑）
+    let file = if create {
+        sys_create(path.as_str())
+    }
+    // 否则只open
+    else {
+        DISKFS.open(path.as_str().into())
+    };
+
+    let Ok(mut file) = file else {
+        return -1;
+    };
+
+    // 决定是否允许截断
+    if trunc {
+        if file.set_len(0).is_err() {
+            return -1;
+        }
+    }
+
+    // 访问权限
+    let readable = matches!(mode, Mode::ReadOnly | Mode::ReadWrite);
+    let writable = matches!(mode, Mode::WriteOnly | Mode::ReadWrite);
+
+    // 分配fd
+    let proc = current();
+    let Some(userproc) = proc.userproc.as_ref() else {
+        return -1;
+    };
+
+    match userproc.alloc_and_insert(OpenFile::new(file, readable, writable)) {
+        Some(fd) => fd as isize,
+        None => -1,
+    }
+}
+
+/// 关闭文件，成功返回0，失败返回-1
+fn sys_close(fd: usize) -> isize {
+    if fd < 3 {
+        // TODO: close 0,1,2都相当于空操作；后续可以改成危险行为
+        return 0;
+    }
+    let current = current();
+    let Some(userproc) = current.userproc.as_ref() else {
+        return -1;
+    };
+    if userproc.close_file(fd) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// 文件不存在时创建；已存在则直接打开，保留内容
+fn sys_create(path: &str) -> Result<File> {
+    match DISKFS.open(path.into()) {
+        Ok(file) => Ok(file),
+        Err(OsError::NoSuchFile) => DISKFS.create(path.into()),
+        Err(e) => Err(e),
+    }
+}
+
+/// 忙等待，直到从标准输入读取1字节
+// TODO: 后续应该支持多字符输入，回车换行才结束输入
+fn read_stdin(buffer: *const u8, size: usize) -> isize {
+    if size == 0 {
+        return 0;
+    }
+    loop {
+        let ch = console_getchar();
+        // 暂时没有键盘输入
+        if ch == usize::MAX {
+            core::hint::spin_loop();
+            continue;
+        }
+        // 只接受合法的单字节输入
+        if ch > u8::MAX as usize {
+            return -1;
+        }
+        let byte = [ch as u8];
+        // 将读取的字符复制到用户缓冲区
+        if copy_to_user(buffer, &byte).is_err() {
+            return -1;
+        }
+        return 1;
+    }
+}
+/// 从fd中读size字节数据到用户缓冲区
+/// 返回实际读取的字节数
+fn sys_read(fd: usize, buffer: *const u8, size: usize) -> isize {
+    match fd {
+        0 => read_stdin(buffer, size),
+        1 | 2 => -1,
+        _ => {
+            let current = current();
+            let Some(proc) = current.userproc.as_ref() else {
+                return -1;
+            };
+
+            let mut buf = [0u8; 512];
+            let mut offset = 0usize;
+            // 避免最终返回值超出 isize 范围
+            if size > isize::MAX as usize {
+                return -1;
+            }
+            while offset < size {
+                let len = (size - offset).min(buf.len());
+                // 从fd读n字节到内核缓冲区buf
+                let Some(n) = proc.read_fd(fd, &mut buf[..len]) else {
+                    if offset > 0 {
+                        return offset as isize;
+                    } else {
+                        return -1;
+                    }
+                };
+                // EOF：没有更多数据
+                if n == 0 {
+                    break;
+                }
+
+                // TODO 先验证用户地址有效？
+                // 从内核缓冲区buf复制到用户缓冲区buffer中的地址addr
+                let Some(addr) = (buffer as usize).checked_add(offset) else {
+                    return -1;
+                };
+                if copy_to_user(addr as *const u8, &buf[..n]).is_err() {
+                    return -1;
+                }
+
+                offset += n;
+            }
+
+            offset as isize
+        }
+    }
+}
+
 /// # sys_write
 /// 从用户缓冲区user_src写size字节到指定的fd
 /// ## Return
 /// - -1: 错误
 /// - 非负整数: 实际写入的字节数
 fn sys_write(fd: usize, user_src: *const u8, size: usize) -> isize {
-    if fd == 0 {
+    if fd == 0 || size > isize::MAX as usize {
         return -1;
     }
+    let mut buf = [0u8; 512];
+    let mut offset = 0usize;
+
     match fd {
         1 | 2 => {
-            let mut buffer = vec![0u8; size];
-            if (copy_from_user(user_src, &mut buffer)).is_err() {
-                return -1;
-            }
+            // let _lock = stdout().lock();
+            while offset < size {
+                let len = (size - offset).min(buf.len());
 
-            let _lock = stdout().lock();
-            // 逐字节输出
-            for &byte in buffer.iter() {
-                console_putchar(byte as usize);
-            }
+                let Some(addr) = (user_src as usize).checked_add(offset) else {
+                    return -1;
+                };
 
-            size as isize
+                // 从用户缓冲区读取到内核缓冲区
+                if copy_from_user(addr as *const u8, &mut buf[..len]).is_err() {
+                    return -1;
+                }
+
+                // 写入控制台
+                let _lock = stdout().lock();
+                for &byte in &buf[..len] {
+                    console_putchar(byte as usize);
+                }
+
+                offset += len;
+            }
         }
         // TODO: 其他文件描述符
-        _ => -1,
+        _ => {
+            let current = current();
+            let Some(proc) = current.userproc.as_ref() else {
+                return -1;
+            };
+
+            while offset < size {
+                let len = (size - offset).min(buf.len());
+                let Some(addr) = (user_src as usize).checked_add(offset) else {
+                    return -1;
+                };
+                if copy_from_user(addr as *const u8, &mut buf[..len]).is_err() {
+                    return -1;
+                }
+
+                let Some(n) = proc.write_fd(fd, &buf[..len]) else {
+                    if offset > 0 {
+                        return offset as isize;
+                    } else {
+                        return -1;
+                    }
+                };
+
+                if n == 0 {
+                    break;
+                }
+
+                offset += n;
+
+                // 短写：返回目前实际写入的字节数
+                if n < len {
+                    break;
+                }
+            }
+        }
     }
+    offset as isize
 }
 
 pub fn read_user_argv(addr: usize) -> Option<Vec<String>> {
@@ -110,6 +314,25 @@ pub fn read_user_argv(addr: usize) -> Option<Vec<String>> {
     None
 }
 
+fn sys_fstat(fd: usize, buf: *const u8) -> isize {
+    let current = current();
+    let Some(proc) = current.userproc.as_ref() else {
+        return -1;
+    };
+    // TODO: 用 proc.get(fd) 取出 (ino, size)，拼成 16 字节写回用户缓冲区
+    let Some((ino, size)) = proc.get_fstat(fd) else {
+        return -1;
+    };
+
+    let mut stat = [0u8; 16];
+    stat[0..8].copy_from_slice(&(ino as u64).to_le_bytes());
+    stat[8..16].copy_from_slice(&(size as u64).to_le_bytes());
+
+    if copy_to_user(buf, &stat).is_err() {
+        return -1;
+    }
+    0
+}
 fn sys_exec(pathname: *const u8, argv: *const usize) -> isize {
     let Some(path) = read_user_cstr(pathname as usize) else {
         return -1;
@@ -129,15 +352,45 @@ fn sys_exec(pathname: *const u8, argv: *const usize) -> isize {
 pub fn syscall_handler(id: usize, args: [usize; 3]) -> isize {
     // TODO: LAB2 impl
     match id {
-        SYS_WRITE => {
-            return sys_write(args[0], args[1] as *const u8, args[2]);
-        }
         SYS_HALT => {
             halt();
         }
         SYS_EXIT => exit(args[0] as i32 as isize),
         SYS_WAIT => wait(args[0] as i32 as isize).unwrap_or(-1),
         SYS_EXEC => sys_exec(args[0] as *const u8, args[1] as *const usize),
+        SYS_OPEN => {
+            let path = args[0] as *const u8;
+            let flags = args[1];
+            const O_CREATE: usize = 0x200;
+            const O_TRUNC: usize = 0x400;
+            // 拒绝不支持的flag
+            if flags & !(0x3 | O_CREATE | O_TRUNC) != 0 {
+                return -1;
+            }
+            // 读写权限
+            let access = flags & 0x3;
+            let mode = match access {
+                0 => Mode::ReadOnly,
+                1 => Mode::WriteOnly,
+                2 => Mode::ReadWrite,
+                _ => {
+                    return -1;
+                }
+            };
+            // 创建/截断
+
+            let create = flags & O_CREATE != 0;
+            let trunc = flags & O_TRUNC != 0;
+
+            sys_open(path, mode, create, trunc)
+        }
+        SYS_CLOSE => sys_close(args[0] as usize),
+        SYS_READ => sys_read(args[0], args[1] as *const u8, args[2]),
+        SYS_WRITE => {
+            return sys_write(args[0], args[1] as *const u8, args[2]);
+        }
+        SYS_FSTAT => sys_fstat(args[0], args[1] as *const u8),
+
         _ => -1,
     }
 }

@@ -4,13 +4,17 @@
 mod load;
 
 use crate::fs::File;
+use crate::io::{Read, Seek, Write};
 use crate::mem::pagetable::KernelPgTable;
 use crate::mem::pagetable::PageTable;
 use crate::mem::PG_SIZE;
 use crate::sbi::shutdown;
+use crate::sync::Mutex;
+use crate::sync::Sleep;
 use crate::thread::{self, current, TaskStruct};
 use crate::trap::{trap_exit_u, Frame};
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -19,14 +23,119 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
 use riscv::register::sstatus;
 
+pub struct OpenFile {
+    pub file: File,
+    pub readable: bool,
+    pub writable: bool,
+}
+
+impl OpenFile {
+    pub fn new(file: File, readable: bool, writable: bool) -> Self {
+        Self {
+            file,
+            readable,
+            writable,
+        }
+    }
+}
+
 pub struct UserProc {
     #[allow(dead_code)]
     bin: File,
+    fd_table: Mutex<BTreeMap<usize, OpenFile>, Sleep>,
 }
 
 impl UserProc {
     pub fn new(file: File) -> Self {
-        Self { bin: file }
+        Self {
+            bin: file,
+            fd_table: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// 返回 fd 对应文件的 (inode 号, 字节长度)，供 fstat 使用。
+    ///
+    /// 这里不返回 `OpenFile` 的副本：`File` 的克隆会复制当前位置，
+    /// 对 fstat 来说没有意义，还会让调用方误以为拿到了同一个句柄。
+    pub fn get_fstat(&self, fd: usize) -> Option<(usize, usize)> {
+        let table = self.fd_table.lock();
+        let entry = table.get(&fd)?;
+        Some((entry.file.inum(), entry.file.len().ok()?))
+    }
+    /// # alloc_and_insert
+    /// 1. 找到最小的空闲文件描述符，从 3 开始
+    /// 2. 分配描述符并插入文件
+    /// 3. 返回分配的描述符
+    /// * 分配描述符和插入文件放在一个函数里是为了避免两次加锁
+    pub fn alloc_and_insert(&self, file: OpenFile) -> Option<usize> {
+        let mut candidate: usize = 3;
+        let mut fd_table = self.fd_table.lock();
+
+        for &fd in fd_table.keys() {
+            if fd < candidate {
+                continue;
+            }
+
+            if fd > candidate {
+                break;
+            }
+
+            candidate = candidate.checked_add(1)?;
+
+            // 上限
+            if candidate >= 1024 {
+                return None;
+            }
+        }
+        fd_table.insert(candidate, file);
+
+        Some(candidate)
+    }
+    /// # close_file
+    /// 关闭给定描述符的文件，返回成功/失败
+    pub fn close_file(&self, fd: usize) -> bool {
+        if fd < 3 {
+            return false;
+        }
+        let file: Option<OpenFile> = self.fd_table.lock().remove(&fd);
+
+        match file {
+            Some(file) => {
+                drop(file);
+                true
+            }
+            None => false,
+        }
+    }
+    pub fn read_fd(&self, fd: usize, buf: &mut [u8]) -> Option<usize> {
+        let mut table = self.fd_table.lock();
+        let entry = table.get_mut(&fd)?;
+
+        if !entry.readable {
+            return None;
+        }
+
+        entry.file.read(buf).ok()
+    }
+
+    pub fn write_fd(&self, fd: usize, buf: &[u8]) -> Option<usize> {
+        let mut table = self.fd_table.lock();
+        let entry = table.get_mut(&fd)?;
+
+        if !entry.writable {
+            return None;
+        }
+
+        entry.file.write(buf).ok()
+    }
+    /// 进程退出时关闭所有打开的文件
+    pub fn close_all_files(&self) {
+        let files = {
+            let mut table = self.fd_table.lock();
+            core::mem::take(&mut *table)
+        };
+
+        drop(files);
     }
 }
 
