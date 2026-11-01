@@ -4,7 +4,7 @@
 mod load;
 
 use crate::fs::File;
-use crate::io::{Read, Seek, Write};
+use crate::io::{Read, Seek, SeekFrom, Write};
 use crate::mem::pagetable::KernelPgTable;
 use crate::mem::pagetable::PageTable;
 use crate::mem::PG_SIZE;
@@ -54,9 +54,6 @@ impl UserProc {
     }
 
     /// 返回 fd 对应文件的 (inode 号, 字节长度)，供 fstat 使用。
-    ///
-    /// 这里不返回 `OpenFile` 的副本：`File` 的克隆会复制当前位置，
-    /// 对 fstat 来说没有意义，还会让调用方误以为拿到了同一个句柄。
     pub fn get_fstat(&self, fd: usize) -> Option<(usize, usize)> {
         let table = self.fd_table.lock();
         let entry = table.get(&fd)?;
@@ -128,6 +125,27 @@ impl UserProc {
 
         entry.file.write(buf).ok()
     }
+    // pub fn remove_fd(&mut self, fd: usize) -> bool {
+    //     let mut table = self.fd_table.lock();
+    //     let Some(removed) = table.remove(&fd) else {
+    //         return false;
+    //     }
+    // }
+
+    pub fn seek_fd(&self, fd: usize, position: usize) -> bool {
+        let mut table = self.fd_table.lock();
+        let Some(entry) = table.get_mut(&fd) else {
+            return false;
+        };
+        entry.file.seek(SeekFrom::Start(position)).is_ok()
+    }
+    pub fn tell_fd(&self, fd: usize) -> Option<usize> {
+        let mut table = self.fd_table.lock();
+        let entry = table.get_mut(&fd)?;
+
+        entry.file.stream_position().ok()
+    }
+
     /// 进程退出时关闭所有打开的文件
     pub fn close_all_files(&self) {
         let files = {

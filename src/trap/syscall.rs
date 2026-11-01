@@ -349,6 +349,31 @@ fn sys_exec(pathname: *const u8, argv: *const usize) -> isize {
     execute(file, args)
 }
 
+fn sys_seek(fd: usize, position: usize) -> isize {
+    let current = current();
+    let proc = current.userproc.as_ref().expect("No user process");
+    proc.seek_fd(fd, position);
+    0
+}
+fn sys_tell(fd: usize) -> isize {
+    let current = current();
+    let proc = current.userproc.as_ref().expect("No user process");
+
+    match proc.tell_fd(fd) {
+        Some(pos) if pos <= isize::MAX as usize => pos as isize,
+        _ => -1,
+    }
+}
+
+fn sys_remove(pathname: *const u8) -> isize {
+    let Some(path) = read_user_cstr(pathname as usize) else {
+        return -1;
+    };
+    match DISKFS.remove(path.as_str().into()) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
 pub fn syscall_handler(id: usize, args: [usize; 3]) -> isize {
     // TODO: LAB2 impl
     match id {
@@ -390,7 +415,9 @@ pub fn syscall_handler(id: usize, args: [usize; 3]) -> isize {
             return sys_write(args[0], args[1] as *const u8, args[2]);
         }
         SYS_FSTAT => sys_fstat(args[0], args[1] as *const u8),
-
+        SYS_SEEK => sys_seek(args[0], args[1]),
+        SYS_TELL => sys_tell(args[0]),
+        SYS_REMOVE => sys_remove(args[0] as *const u8),
         _ => -1,
     }
 }
