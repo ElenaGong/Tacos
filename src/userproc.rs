@@ -5,8 +5,7 @@ mod load;
 
 use crate::fs::File;
 use crate::io::{Read, Seek, SeekFrom, Write};
-use crate::mem::pagetable::KernelPgTable;
-use crate::mem::pagetable::PageTable;
+use crate::mem::pagetable::{KernelPgTable, PageTable};
 use crate::mem::PG_SIZE;
 use crate::sbi::shutdown;
 use crate::sync::Mutex;
@@ -125,12 +124,6 @@ impl UserProc {
 
         entry.file.write(buf).ok()
     }
-    // pub fn remove_fd(&mut self, fd: usize) -> bool {
-    //     let mut table = self.fd_table.lock();
-    //     let Some(removed) = table.remove(&fd) else {
-    //         return false;
-    //     }
-    // }
 
     pub fn seek_fd(&self, fd: usize, position: usize) -> bool {
         let mut table = self.fd_table.lock();

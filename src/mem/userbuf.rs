@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
 use crate::error::OsError;
-use crate::mem::in_kernel_space;
+use crate::mem::{get_pte, in_kernel_space, PG_SIZE};
 use crate::Result;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::global_asm;
@@ -108,6 +109,48 @@ pub fn read_user_cstr(addr: usize) -> Option<String> {
         bytes.push(byte[0]);
     }
     None
+}
+/// 检查当前进程的用户虚拟地址区间 [addr, addr + len)
+/// 是否全部映射为用户可写页面。
+pub fn user_range_writable(addr: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+
+    // 计算最后一个字节，防止整数溢出
+    let Some(last) = addr.checked_add(len - 1) else {
+        return false;
+    };
+
+    // 排除内核地址
+    if in_kernel_space(addr) || in_kernel_space(last) {
+        return false;
+    }
+
+    // Sv39 低半区的规范用户地址范围
+    const USER_LIMIT: usize = 1usize << 38;
+
+    if last >= USER_LIMIT {
+        return false;
+    }
+
+    // 找到覆盖范围中的第一个和最后一个虚拟页号
+    let first_page = addr / PG_SIZE;
+    let last_page = last / PG_SIZE;
+
+    for page in first_page..=last_page {
+        let va = page * PG_SIZE;
+
+        let Some(pte) = get_pte(va) else {
+            return false;
+        };
+
+        if !pte.is_valid() || !pte.is_leaf() || !pte.is_user() || !pte.is_rwable() {
+            return false;
+        }
+    }
+
+    true
 }
 
 extern "C" {

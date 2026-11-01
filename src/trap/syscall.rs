@@ -10,6 +10,7 @@ use crate::sbi::console_getchar;
 use crate::thread::current;
 use crate::{OsError, Result};
 
+use crate::mem::userbuf::user_range_writable;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -148,51 +149,58 @@ fn read_stdin(buffer: *const u8, size: usize) -> isize {
 /// 从fd中读size字节数据到用户缓冲区
 /// 返回实际读取的字节数
 fn sys_read(fd: usize, buffer: *const u8, size: usize) -> isize {
-    match fd {
-        0 => read_stdin(buffer, size),
-        1 | 2 => -1,
-        _ => {
-            let current = current();
-            let Some(proc) = current.userproc.as_ref() else {
+    if size > isize::MAX as usize {
+        return -1;
+    }
+    if fd == 1 || fd == 2 {
+        return -1;
+    }
+    // 在进行任何 I/O 前，检查整个用户缓冲区
+    if !user_range_writable(buffer as usize, size) {
+        return -1;
+    }
+
+    // 标准输入：同样已完成缓冲区检查
+    if fd == 0 {
+        return read_stdin(buffer, size);
+    }
+
+    let current = current();
+    let Some(proc) = current.userproc.as_ref() else {
+        return -1;
+    };
+    let mut buf = [0u8; 512];
+    let mut offset = 0usize;
+
+    while offset < size {
+        let len = (size - offset).min(buf.len());
+
+        // fd文件 -> 内核缓冲区
+        let Some(n) = proc.read_fd(fd, &mut buf[..len]) else {
+            if offset > 0 {
+                return offset as isize;
+            } else {
                 return -1;
             };
+        };
 
-            let mut buf = [0u8; 512];
-            let mut offset = 0usize;
-            // 避免最终返回值超出 isize 范围
-            if size > isize::MAX as usize {
-                return -1;
-            }
-            while offset < size {
-                let len = (size - offset).min(buf.len());
-                // 从fd读n字节到内核缓冲区buf
-                let Some(n) = proc.read_fd(fd, &mut buf[..len]) else {
-                    if offset > 0 {
-                        return offset as isize;
-                    } else {
-                        return -1;
-                    }
-                };
-                // EOF：没有更多数据
-                if n == 0 {
-                    break;
-                }
-
-                // TODO 先验证用户地址有效？
-                // 从内核缓冲区buf复制到用户缓冲区buffer中的地址addr
-                let Some(addr) = (buffer as usize).checked_add(offset) else {
-                    return -1;
-                };
-                if copy_to_user(addr as *const u8, &buf[..n]).is_err() {
-                    return -1;
-                }
-
-                offset += n;
-            }
-
-            offset as isize
+        if n == 0 {
+            break;
         }
+
+        // 用户缓冲区地址
+        let Some(addr) = (buffer as usize).checked_add(offset) else {
+            return -1;
+        };
+        // 内核缓冲区 -> 用户缓冲区
+        if copy_to_user(addr as *const u8, &buf[..n]).is_err() {
+            return -1;
+        }
+
+        offset += n;
     }
+
+    offset as isize
 }
 
 /// # sys_write
