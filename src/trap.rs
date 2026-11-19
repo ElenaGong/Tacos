@@ -135,16 +135,16 @@ arch::global_asm! {r#"
     trap_entry_u:
 
     # (1) Immediately switch to kernel stack.
-    # We assume that `sscratch` stores the kernel stack.
+    # We assume that `sscratch` stores the kernel stack. 互换sp和sscratch的值, 现在sp保存内核栈指针
         csrrw sp, sscratch, sp
 
     # Now `sscratch` stores user stack.
     # See the comments in `trap_exit_u` for details of `sscratch` management.
 
-    # (2) Stores Frame on kernel stack.
+    # (2) Stores Frame on kernel stack. 保存内核栈帧
         addi sp, sp, -34*8
 
-    # (2.1) Save general purpose regs except sp and x0.
+    # (2.1) Save general purpose regs except sp and x0. 保存除了x0和x2（也就是sp）以外的通用目的寄存器
         # sd x0, 0*8(sp)
         sd x1,   1*8(sp)
         # sd sp, 2*8(sp)
@@ -179,7 +179,7 @@ arch::global_asm! {r#"
         sd x31, 31*8(sp)
 
     # Now we can use registers.
-    # (2.2) Save CSRs.
+    # (2.2) Save CSRs. 控制与状态寄存器
         csrr t0, sstatus
         csrr t1, sepc
 

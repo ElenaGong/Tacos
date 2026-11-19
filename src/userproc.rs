@@ -10,7 +10,7 @@ use crate::mem::PG_SIZE;
 use crate::sbi::shutdown;
 use crate::sync::Mutex;
 use crate::sync::Sleep;
-use crate::thread::{self, current, TaskStruct};
+use crate::thread::{self, current, TaskStruct, STACK_TOP};
 use crate::trap::{trap_exit_u, Frame};
 
 use alloc::collections::BTreeMap;
@@ -19,7 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::mem::MaybeUninit;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use riscv::register::sstatus;
 
 pub struct OpenFile {
@@ -42,6 +42,8 @@ pub struct UserProc {
     #[allow(dead_code)]
     bin: File,
     fd_table: Mutex<BTreeMap<usize, OpenFile>, Sleep>,
+    // stack_top: usize,
+    pub stack_bottom: AtomicUsize,
 }
 
 impl UserProc {
@@ -49,6 +51,7 @@ impl UserProc {
         Self {
             bin: file,
             fd_table: Mutex::new(BTreeMap::new()),
+            stack_bottom: AtomicUsize::new(STACK_TOP - PG_SIZE),
         }
     }
 

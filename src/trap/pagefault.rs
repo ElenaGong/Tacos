@@ -1,13 +1,85 @@
+use crate::mem::palloc::UserPool;
 use crate::mem::userbuf::{
     __knrl_read_usr_byte_pc, __knrl_read_usr_exit, __knrl_write_usr_byte_pc, __knrl_write_usr_exit,
 };
-use crate::mem::PageTable;
-use crate::thread::{self};
+use crate::mem::{PTEFlags, PageAlign, PageTable, PhysAddr, PG_SIZE};
+use crate::thread::{current, STACK_LIMIT, STACK_TOP};
+// use crate::thread::{self};
 use crate::trap::Frame;
 use crate::userproc;
+use core::sync::atomic::Ordering;
 
 use riscv::register::scause::Exception::{self, *};
 use riscv::register::sstatus::{self, SPP};
+
+/// 尝试增长栈
+fn try_grow_stack(frame: &Frame, fault: Exception, addr: usize) -> bool {
+    // 1. 检查访问类型
+    if !matches!(fault, LoadPageFault | StorePageFault) {
+        return false;
+    }
+
+    // 2. 获取用户态 SP
+    let sp = frame.x[2];
+
+    // 3. 获取当前进程的 stack_bottom
+    let current_thread = current();
+
+    let Some(userproc) = current_thread.userproc.as_ref() else {
+        return false;
+    };
+
+    let st_bottom = userproc.stack_bottom.load(Ordering::Relaxed);
+    let page_floor = addr.floor();
+
+    // 4. 检查栈增长边界
+    let stack_access_legal: bool = addr >= sp;
+    let sp_legal: bool = sp >= STACK_LIMIT && sp <= STACK_TOP;
+    let growth_dir_legal: bool = page_floor < st_bottom;
+    let within_limit: bool = addr < STACK_TOP && page_floor >= STACK_LIMIT;
+
+    if !(stack_access_legal && sp_legal && growth_dir_legal && within_limit) {
+        return false;
+    }
+
+    // 5. 获取当前进程页表
+    let Some(pt) = current_thread.pagetable.as_ref() else {
+        return false;
+    };
+    let mut table = pt.lock();
+
+    // 6. 检查所有待分配页面是否存在映射冲突
+    let mut va = page_floor;
+    while va < st_bottom {
+        if table.get_pte(va).map_or(false, |entry| entry.is_valid()) {
+            return false;
+        }
+        va += PG_SIZE;
+    }
+
+    // 7. 从UserPool分配页面并建立页表映射
+    let flags = PTEFlags::V | PTEFlags::R | PTEFlags::W | PTEFlags::U;
+
+    let mut va = page_floor;
+
+    while va < st_bottom {
+        let page = unsafe { UserPool::alloc_pages(1) };
+        unsafe {
+            core::ptr::write_bytes(page, 0, PG_SIZE);
+        }
+        let pa = PhysAddr::from(page);
+        table.map(pa, va, PG_SIZE, flags);
+
+        va += PG_SIZE;
+    }
+    // 8. 更新 stack_bottom
+    userproc.stack_bottom.store(page_floor, Ordering::Relaxed);
+
+    // 9. 刷新 TLB
+    table.activate();
+
+    true
+}
 
 pub fn handler(frame: &mut Frame, fault: Exception, addr: usize) {
     let privilege = frame.sstatus.spp();
@@ -53,10 +125,9 @@ pub fn handler(frame: &mut Frame, fault: Exception, addr: usize) {
             }
         }
         SPP::User => {
-            kprintln!(
-                "User thread {} dying due to page fault.",
-                thread::current().name()
-            );
+            if try_grow_stack(frame, fault, addr) {
+                return;
+            }
             userproc::exit(-1);
         }
     }
