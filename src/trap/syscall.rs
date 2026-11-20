@@ -38,6 +38,8 @@ const SYS_SEEK: usize = 9;
 const SYS_TELL: usize = 10;
 const SYS_CLOSE: usize = 11;
 const SYS_FSTAT: usize = 12;
+const SYS_MMAP: usize = 13;
+const SYS_MUNMAP: usize = 14;
 
 /* -------------------------------------------------------------------------- */
 /*                             SYSCALL FUNCTIONS                              */
@@ -382,6 +384,16 @@ fn sys_remove(pathname: *const u8) -> isize {
         Err(_) => -1,
     }
 }
+
+fn sys_mmap(fd: usize, addr: usize) -> isize {
+    let thread = current();
+    let Some(proc) = thread.userproc.as_ref() else {
+        return -1;
+    };
+
+    proc.mmap(fd, addr)
+}
+
 pub fn syscall_handler(id: usize, args: [usize; 3]) -> isize {
     // TODO: LAB2 impl
     match id {
@@ -419,13 +431,12 @@ pub fn syscall_handler(id: usize, args: [usize; 3]) -> isize {
         }
         SYS_CLOSE => sys_close(args[0] as usize),
         SYS_READ => sys_read(args[0], args[1] as *const u8, args[2]),
-        SYS_WRITE => {
-            return sys_write(args[0], args[1] as *const u8, args[2]);
-        }
+        SYS_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYS_FSTAT => sys_fstat(args[0], args[1] as *const u8),
         SYS_SEEK => sys_seek(args[0], args[1]),
         SYS_TELL => sys_tell(args[0]),
         SYS_REMOVE => sys_remove(args[0] as *const u8),
+        SYS_MMAP => sys_mmap(args[0] as usize, args[1] as usize),
         _ => -1,
     }
 }

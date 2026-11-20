@@ -5,8 +5,9 @@ mod load;
 
 use crate::fs::File;
 use crate::io::{Read, Seek, SeekFrom, Write};
+use crate::mem::mmap::Mapping;
 use crate::mem::pagetable::{KernelPgTable, PageTable};
-use crate::mem::PG_SIZE;
+use crate::mem::{PageAlign, PG_SIZE};
 use crate::sbi::shutdown;
 use crate::sync::Mutex;
 use crate::sync::Sleep;
@@ -38,11 +39,22 @@ impl OpenFile {
     }
 }
 
+/// 记录被mmap的页的元数据
+pub struct MmapPage {
+    mapid: usize,       // 由mapid能找到Mapping
+    file_offset: usize, // 找到该页从文件中的什么地方开始
+    read_bytes: usize,  // 如果等于PG_SIZE就为一整页；小于就用0补齐
+}
+
+impl MmapPage {}
+
 pub struct UserProc {
     #[allow(dead_code)]
     bin: File,
     fd_table: Mutex<BTreeMap<usize, OpenFile>, Sleep>,
-    // stack_top: usize,
+    pages: Mutex<BTreeMap<usize, MmapPage>, Sleep>,
+    mappings: Mutex<BTreeMap<usize, Mapping>, Sleep>,
+    next_mapid: AtomicUsize,
     pub stack_bottom: AtomicUsize,
 }
 
@@ -51,6 +63,9 @@ impl UserProc {
         Self {
             bin: file,
             fd_table: Mutex::new(BTreeMap::new()),
+            pages: Mutex::new(BTreeMap::new()),
+            mappings: Mutex::new(BTreeMap::new()),
+            next_mapid: AtomicUsize::new(1),
             stack_bottom: AtomicUsize::new(STACK_TOP - PG_SIZE),
         }
     }
@@ -150,6 +165,108 @@ impl UserProc {
         };
 
         drop(files);
+    }
+
+    pub fn not_mapped(&self, start: usize, end: usize) -> bool {
+        let maps = self.mappings.lock();
+
+        // 与已有 mmap 区间检查冲突
+        for mapping in maps.values() {
+            let pages = mapping.length / PG_SIZE + usize::from(mapping.length % PG_SIZE != 0);
+            let old_end = mapping.start + pages * PG_SIZE;
+
+            if start < old_end && mapping.start < end {
+                return false;
+            }
+        }
+
+        // 与已存在的页表映射检查冲突
+        let thread = current();
+        let Some(pt) = thread.pagetable.as_ref() else {
+            return false;
+        };
+        let table = pt.lock();
+
+        let mut va = start;
+        while va < end {
+            if table.get_pte(va).is_some_and(|e| e.is_valid()) {
+                return false;
+            }
+            va += PG_SIZE;
+        }
+        drop(table);
+
+        true
+    }
+
+    /// mmap
+    pub fn mmap(&self, fd: usize, addr: usize) -> isize {
+        if fd < 3 || addr == 0 || !addr.is_aligned() {
+            return -1;
+        }
+        let table = self.fd_table.lock();
+        let Some(entry) = table.get(&fd) else {
+            return -1;
+        };
+
+        let (file, file_len) = {
+            let Ok(len) = entry.file.len() else {
+                return -1;
+            };
+            // 复制文件句柄既能让映射在原 fd 关闭后继续有效，
+            // 也能避免 mmap 懒加载时改变原 fd 的读写位置
+            (entry.file.clone(), len)
+        };
+        if file_len == 0 {
+            return -1;
+        }
+
+        // 计算end地址
+        let n_pages = file_len / PG_SIZE + usize::from(file_len % PG_SIZE != 0);
+        let Some(map_size) = n_pages.checked_mul(PG_SIZE) else {
+            return -1;
+        };
+        let Some(end) = addr.checked_add(map_size) else {
+            return -1;
+        };
+
+        // 必须位于 Sv39 用户低半区
+        const USER_VA_END: usize = 1usize << 38;
+        if end > USER_VA_END {
+            return -1;
+        }
+
+        // 与已有 mmap 区间检查冲突
+        // 与已存在的页表映射检查冲突
+        if !self.not_mapped(addr, end) {
+            return -1;
+        }
+
+        // 分配mapid
+        let mut maps = self.mappings.lock();
+        let mapid = self.next_mapid.load(Ordering::Relaxed);
+        if mapid == 0 || mapid > isize::MAX as usize {
+            return -1;
+        }
+
+        // 登记 Mapping（lazy）
+        maps.insert(
+            mapid,
+            Mapping {
+                file: file,
+                start: addr,
+                length: file_len,
+            },
+        );
+
+        self.next_mapid.store(mapid + 1, Ordering::Relaxed);
+        mapid as isize
+    }
+
+    pub fn load_mmap_page(addr: usize) -> bool {
+        // TODO
+
+        false
     }
 }
 

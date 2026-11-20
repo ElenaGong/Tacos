@@ -9,6 +9,7 @@
 
 pub mod layout;
 pub mod malloc;
+pub mod mmap;
 pub mod pagetable;
 pub mod palloc;
 pub mod userbuf;
