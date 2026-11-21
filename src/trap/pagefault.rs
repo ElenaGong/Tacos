@@ -4,6 +4,7 @@ use crate::mem::userbuf::{
 };
 use crate::mem::{PTEFlags, PageAlign, PageTable, PhysAddr, PG_SIZE};
 use crate::thread::{current, STACK_LIMIT, STACK_TOP};
+use mem::mmap::FaultAccess;
 // use crate::thread::{self};
 use crate::trap::Frame;
 use crate::userproc;
@@ -21,6 +22,12 @@ fn alloc_user_page(va: usize, pg_table: &mut PageTable, flags: PTEFlags) -> Opti
     pg_table.map(pa, va, PG_SIZE, flags);
 
     Some(pa)
+}
+
+/// 用户态缺页处理结果
+enum FaultError {
+    InvalidAccess,
+    LoadFailed,
 }
 
 /// 尝试增长栈
@@ -83,10 +90,71 @@ fn try_grow_stack(frame: &Frame, fault: Exception, addr: usize) -> bool {
     true
 }
 
+/// 处理用户态 Page Fault
+fn handle_user_page_fault(frame: &Frame, fault: Exception, addr: usize) -> Result<(), FaultError> {
+    // 判断访问类型
+    let access = match fault {
+        LoadPageFault => FaultAccess::Read,
+        StorePageFault => FaultAccess::Write,
+        InstructionPageFault => FaultAccess::Execute,
+        _ => return Err(FaultError::InvalidAccess),
+    };
+
+    let page_va = addr.floor();
+    let thread = current();
+    let proc = thread.userproc.as_ref().ok_or(FaultError::InvalidAccess)?;
+
+    // 查询当前页表
+    let pt = thread.pagetable.as_ref().ok_or(FaultError::InvalidAccess)?;
+
+    {
+        let table = pt.lock();
+
+        if let Some(pte) = table.get_pte(page_va) {
+            if pte.is_valid() && pte.is_leaf() {
+                // 已映射却产生 Page Fault
+                // 简化设计：按权限异常处理
+                // 实际还需考虑 A/D 位等情况
+                return Err(FaultError::InvalidAccess);
+            }
+        }
+    }
+
+    // 优先检查 mmap 预留区域
+    if let Some(mapping) = proc.find_mapping(page_va) {
+        if !mapping.allow(access) {
+            return Err(FaultError::InvalidAccess);
+        }
+
+        // let mut table = pt.lock();
+        if proc.load_mmap_page(page_va, pt) {
+            return Ok(());
+        }
+        return Err(FaultError::LoadFailed);
+    }
+
+    // TODO ELF Lazy Loading（后续实现）
+    // if let Some(segment) = proc.find_lazy_segment(page_va) {
+    //     if !segment.allows(access) {
+    //         return Err(FaultError::InvalidAccess);
+    //     }
+
+    //     return load_elf_page(proc, pt, page_va, &segment).map_err(|_| LoadFailed);
+    // }
+
+    // 尝试 Stack Growth
+    if try_grow_stack(frame, fault, addr) {
+        return Ok(());
+    }
+
+    // 所有条件均不满足
+    Err(FaultError::InvalidAccess)
+}
+
 pub fn handler(frame: &mut Frame, fault: Exception, addr: usize) {
     let privilege = frame.sstatus.spp();
 
-    let present = {
+    let _present = {
         let table = unsafe { PageTable::effective_pagetable() };
         match table.get_pte(addr) {
             Some(entry) => entry.is_valid(),
@@ -96,21 +164,21 @@ pub fn handler(frame: &mut Frame, fault: Exception, addr: usize) {
 
     unsafe { sstatus::set_sie() };
 
-    kprintln!(
-        "Page fault at {:#x}: {} error {} page in {} context.",
-        addr,
-        if present { "rights" } else { "not present" },
-        match fault {
-            StorePageFault => "writing",
-            LoadPageFault => "reading",
-            InstructionPageFault => "fetching instruction",
-            _ => panic!("Unknown Page Fault"),
-        },
-        match privilege {
-            SPP::Supervisor => "kernel",
-            SPP::User => "user",
-        }
-    );
+    // kprintln!(
+    //     "Page fault at {:#x}: {} error {} page in {} context.",
+    //     addr,
+    //     if present { "rights" } else { "not present" },
+    //     match fault {
+    //         StorePageFault => "writing",
+    //         LoadPageFault => "reading",
+    //         InstructionPageFault => "fetching instruction",
+    //         _ => panic!("Unknown Page Fault"),
+    //     },
+    //     match privilege {
+    //         SPP::Supervisor => "kernel",
+    //         SPP::User => "user",
+    //     }
+    // );
 
     match privilege {
         SPP::Supervisor => {
@@ -127,10 +195,24 @@ pub fn handler(frame: &mut Frame, fault: Exception, addr: usize) {
             }
         }
         SPP::User => {
-            if try_grow_stack(frame, fault, addr) {
-                return;
+            match handle_user_page_fault(frame, fault, addr) {
+                Ok(()) => {
+                    // Page Fault 成功处理
+                    // 保持 frame.sepc 不变
+                    // 返回后重新执行原指令
+                    return;
+                }
+
+                Err(FaultError::InvalidAccess) => {
+                    // 非法地址或权限错误
+                    userproc::exit(-1);
+                }
+
+                Err(FaultError::LoadFailed) => {
+                    // 页面分配或文件加载失败
+                    userproc::exit(-1);
+                }
             }
-            userproc::exit(-1);
         }
     }
 }

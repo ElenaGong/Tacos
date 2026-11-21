@@ -116,7 +116,7 @@ pub extern "C" fn main(hart_id: usize, dtb: usize) -> ! {
 
     #[cfg(feature = "shell")]
     {
-        // TODO: Lab 0
+        // Lab 0
         loop {
             kprint!("PKUOS>");
             use alloc::string::String;

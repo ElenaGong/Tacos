@@ -7,8 +7,10 @@ use crate::fs::File;
 use crate::io::{Read, Seek, SeekFrom, Write};
 use crate::mem::mmap::Mapping;
 use crate::mem::pagetable::{KernelPgTable, PageTable};
-use crate::mem::{PageAlign, PG_SIZE};
+use crate::mem::palloc::UserPool;
+use crate::mem::{PTEFlags, PageAlign, PhysAddr, PG_SIZE};
 use crate::sbi::shutdown;
+use crate::sync::Intr;
 use crate::sync::Mutex;
 use crate::sync::Sleep;
 use crate::thread::{self, current, TaskStruct, STACK_TOP};
@@ -17,12 +19,14 @@ use crate::trap::{trap_exit_u, Frame};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use riscv::register::sstatus;
 
+#[derive(Clone)]
 pub struct OpenFile {
     pub file: File,
     pub readable: bool,
@@ -40,6 +44,7 @@ impl OpenFile {
 }
 
 /// 记录被mmap的页的元数据
+#[derive(Clone)]
 pub struct MmapPage {
     mapid: usize,       // 由mapid能找到Mapping
     file_offset: usize, // 找到该页从文件中的什么地方开始
@@ -81,7 +86,7 @@ impl UserProc {
     /// 2. 分配描述符并插入文件
     /// 3. 返回分配的描述符
     /// * 分配描述符和插入文件放在一个函数里是为了避免两次加锁
-    pub fn alloc_and_insert(&self, file: OpenFile) -> Option<usize> {
+    pub fn alloc_and_insert_fd(&self, file: OpenFile) -> Option<usize> {
         let mut candidate: usize = 3;
         let mut fd_table = self.fd_table.lock();
 
@@ -199,6 +204,26 @@ impl UserProc {
         true
     }
 
+    fn find_mmap(&self, va: usize) -> Option<MmapPage> {
+        let pages = self.pages.lock();
+        let Some(mmap_page) = pages.get(&va) else {
+            return None;
+        };
+        Some(mmap_page.clone())
+    }
+
+    pub fn find_mapping(&self, va: usize) -> Option<Mapping> {
+        let Some(mmap_page) = self.find_mmap(va) else {
+            return None;
+        };
+        let mapid = mmap_page.mapid;
+        let maps = self.mappings.lock();
+        let Some(mapping) = maps.get(&mapid) else {
+            return None;
+        };
+        Some(mapping.clone())
+    }
+
     /// mmap
     pub fn mmap(&self, fd: usize, addr: usize) -> isize {
         if fd < 3 || addr == 0 || !addr.is_aligned() {
@@ -215,7 +240,7 @@ impl UserProc {
             };
             // 复制文件句柄既能让映射在原 fd 关闭后继续有效，
             // 也能避免 mmap 懒加载时改变原 fd 的读写位置
-            (entry.file.clone(), len)
+            (entry.clone(), len)
         };
         if file_len == 0 {
             return -1;
@@ -250,23 +275,112 @@ impl UserProc {
         }
 
         // 登记 Mapping（lazy）
+        let flag_r = match file.readable {
+            true => PTEFlags::R,
+            false => PTEFlags::empty(),
+        };
+        let flag_w = match file.writable {
+            true => PTEFlags::W,
+            false => PTEFlags::empty(),
+        };
         maps.insert(
             mapid,
             Mapping {
-                file: file,
+                openfile: file,
                 start: addr,
                 length: file_len,
+                flags: flag_r | flag_w | PTEFlags::U,
+                // 暂时不设为valid是因为懒加载；load时需要补上
             },
         );
 
+        drop(maps);
+
+        // 为每个被映射的虚拟页保存元数据
+        let mut pg_number = 0;
+        let mut va = addr;
+        let mut file_offset = 0;
+
+        let mut pages = self.pages.lock();
+
+        while pg_number < n_pages {
+            let mut read_bytes = PG_SIZE;
+            if pg_number == n_pages - 1 {
+                read_bytes = file_len - PG_SIZE * (n_pages - 1);
+            }
+            pages.insert(
+                va,
+                MmapPage {
+                    mapid: mapid,
+                    file_offset: file_offset,
+                    read_bytes: read_bytes,
+                },
+            );
+
+            pg_number += 1;
+            va += PG_SIZE;
+            file_offset += PG_SIZE;
+        }
+
+        drop(pages);
+
+        // 更新next_mapid
         self.next_mapid.store(mapid + 1, Ordering::Relaxed);
+
         mapid as isize
     }
 
-    pub fn load_mmap_page(addr: usize) -> bool {
-        // TODO
+    pub fn load_mmap_page(&self, addr: usize, pt: &Mutex<PageTable, Intr>) -> bool {
+        let page_va = addr.floor();
+        let pg_table = pt.lock();
+        if let Some(entry) = pg_table.get_pte(page_va) {
+            if entry.is_valid() {
+                return true;
+            }
+        }
+        drop(pg_table);
 
-        false
+        // 把磁盘中的文件的指定部分加载到页中，
+        // 获取mmap_page和mapping
+
+        let Some(mmap_page) = self.find_mmap(page_va) else {
+            return false;
+        };
+        let Some(mapping) = self.find_mapping(page_va) else {
+            return false;
+        };
+
+        // 打开指定文件并用seek定位到offset处
+        let mut file = mapping.openfile.file;
+        let buf = unsafe { UserPool::alloc_pages(1) };
+        let page = unsafe { (buf as *mut [u8; PG_SIZE]).as_mut().unwrap() };
+        let file_offset = mmap_page.file_offset;
+        let read_bytes = mmap_page.read_bytes;
+
+        let Ok(_pos) = file.seek(SeekFrom::Start(file_offset)) else {
+            return false;
+        };
+
+        let mut filebuf = vec![0u8; read_bytes];
+
+        // 将read_bytes长度的文件片段读到filebuf中
+        let Ok(_bytes) = file.read_exact(&mut filebuf) else {
+            return false;
+        };
+        // 再读到指定物理页，并用0补齐
+        page[..read_bytes].copy_from_slice(&filebuf);
+        page[read_bytes..].fill(0);
+
+        let pa = PhysAddr::from(buf);
+
+        // 对页表加锁并更新valid（注意，因为不能在关闭中断时进行I/O，所以在这里统一进行）
+        let mut pg_table = pt.lock();
+
+        // 建立物理页映射并更新页表项为valid
+        pg_table.map(pa, page_va, PG_SIZE, mapping.flags | PTEFlags::V);
+        pg_table.activate();
+
+        true
     }
 }
 

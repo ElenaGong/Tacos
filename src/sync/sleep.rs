@@ -38,20 +38,6 @@ impl Default for Sleep {
     }
 }
 
-// struct SleepInner {
-//     sem: Semaphore,
-//     state:
-// }
-
-impl Sleep {
-    // fn try_acquire(&self) -> bool {
-    //     // TODO: （原子地）实现真正的aqcuire
-    //     if self.inner.value() == 0 {
-    //         return false;
-    //     }
-    //     return true;
-    // }
-}
 impl Lock for Sleep {
     fn acquire(&self) {
         let old = interrupt::set(false);

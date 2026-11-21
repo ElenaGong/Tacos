@@ -91,7 +91,7 @@ fn sys_open(pathname: *const u8, mode: Mode, create: bool, trunc: bool) -> isize
         return -1;
     };
 
-    match userproc.alloc_and_insert(OpenFile::new(file, readable, writable)) {
+    match userproc.alloc_and_insert_fd(OpenFile::new(file, readable, writable)) {
         Some(fd) => fd as isize,
         None => -1,
     }
