@@ -3,13 +3,14 @@
 
 mod load;
 
+use crate::fs::disk::Swap;
 use crate::fs::File;
 use crate::io::{Read, Seek, SeekFrom, Write};
+use crate::mem::frame::{alloc_frame, free_frame, insert_frame, remove_frames_of, unpin_frame};
 use crate::mem::mmap::Mapping;
 use crate::mem::pagetable::{KernelPgTable, PageTable};
-use crate::mem::palloc::UserPool;
 use crate::mem::spt::{PageMeta, PageState, SptEntry, SupplementalPageTable};
-use crate::mem::{PTEFlags, PageAlign, PhysAddr, PG_SIZE};
+use crate::mem::{PTEFlags, PageAlign, PG_SIZE};
 use crate::sbi::shutdown;
 use crate::sync::Intr;
 use crate::sync::Mutex;
@@ -68,7 +69,7 @@ pub struct UserProc {
     mappings: Mutex<BTreeMap<usize, Mapping>, Sleep>,
     next_mapid: AtomicUsize,
     pub stack_bottom: AtomicUsize,
-    vm_lock: Mutex<(), Sleep>,
+    pub user_sp: AtomicUsize,
 }
 
 impl UserProc {
@@ -80,7 +81,7 @@ impl UserProc {
             mappings: Mutex::new(BTreeMap::new()),
             next_mapid: AtomicUsize::new(1),
             stack_bottom: AtomicUsize::new(STACK_TOP - PG_SIZE),
-            vm_lock: Mutex::new(()),
+            user_sp: AtomicUsize::new(STACK_TOP),
         }
     }
 
@@ -245,6 +246,29 @@ impl UserProc {
         Some(entry.clone())
     }
 
+    /// 更新一页的 SPT 状态
+    pub fn set_page_state(&self, va: usize, state: PageState) -> bool {
+        let mut pages = self.spt.lock();
+        let Some(entry) = pages.get_mut(va) else {
+            return false;
+        };
+        entry.state = state;
+        true
+    }
+
+    /// 回收所有处于 Swapped 状态的页面的 swap slot（进程退出时调用）
+    pub fn release_swap_slots(&self) {
+        let snapshot = {
+            let pages = self.spt.lock();
+            pages.snapshot()
+        };
+        for entry in snapshot {
+            if let PageState::Swapped { slot } = entry.state {
+                Swap::free_slot(slot);
+            }
+        }
+    }
+
     pub fn find_mapping(&self, va: usize) -> Option<Mapping> {
         let Some(entry) = self.find_page(va) else {
             return None;
@@ -267,7 +291,7 @@ impl UserProc {
 
     /// mmap
     pub fn mmap(&self, fd: usize, addr: usize) -> isize {
-        let _vm_guard = self.vm_lock.lock();
+        let _vm_guard = crate::mem::frame::VM_LOCK.lock();
         if fd < 3 || addr == 0 || !addr.is_aligned() {
             return -1;
         }
@@ -378,7 +402,7 @@ impl UserProc {
     }
 
     pub fn lazily_load_page(&self, addr: usize, pt: &Mutex<PageTable, Intr>) -> bool {
-        let _vm_guard = self.vm_lock.lock();
+        let _vm_guard = crate::mem::frame::VM_LOCK.lock();
         let page_va = addr.floor();
 
         let pg_table = pt.lock();
@@ -398,77 +422,104 @@ impl UserProc {
             entry.clone()
         };
 
-        if !matches!(spt_entry.state, PageState::Unloaded) {
+        // 判断页面来源：Unloaded 从文件读取，Swapped 从 swap 换入
+        let swapped = match spt_entry.state {
+            PageState::Unloaded => None,
+            PageState::Swapped { slot } => Some(slot),
+            PageState::Resident => return false,
+        };
+
+        // 分配物理页（统一登记进 Frame Table）
+        let Some(pa) = alloc_frame(current(), page_va) else {
             return false;
-        }
+        };
+        let page = unsafe { (pa.into_va() as *mut [u8; PG_SIZE]).as_mut().unwrap() };
 
-        // 分配物理页并先清零
-        let buf = unsafe { UserPool::alloc_pages(1) };
-        let page = unsafe { (buf as *mut [u8; PG_SIZE]).as_mut().unwrap() };
-        page.fill(0);
-
-        let load_ok = match &spt_entry.meta {
-            PageMeta::Mmap {
-                mapid,
-                file_offset,
-                read_bytes,
-            } => {
-                let file = {
-                    let mappings = self.mappings.lock();
-                    mappings.get(mapid).map(|m| m.openfile.file.clone())
-                };
-
-                if *read_bytes > PG_SIZE {
-                    false
-                } else if let Some(mut file) = file {
-                    read_file_part(&mut file, *file_offset, &mut page[..*read_bytes])
-                } else {
-                    false
-                }
+        let load_ok = match swapped {
+            Some(slot) => {
+                // 从 swap 读回整页
+                Swap::read_page(slot, page)
             }
-            PageMeta::Elf { chunks } => {
-                // 从 userproc.bin 中分别读取各个片段，写入各自的页内位置
-                let mut file = self.bin.clone();
-                let mut elf_load_ok = true;
-                for chunk in chunks {
-                    let end = chunk.page_offset + chunk.len;
-                    if end > PG_SIZE {
-                        return false;
+            None => {
+                // 先清零，再从后备存储读取
+                page.fill(0);
+                match &spt_entry.meta {
+                    PageMeta::Mmap {
+                        mapid,
+                        file_offset,
+                        read_bytes,
+                    } => {
+                        let file = {
+                            let mappings = self.mappings.lock();
+                            mappings.get(mapid).map(|m| m.openfile.file.clone())
+                        };
+
+                        if *read_bytes > PG_SIZE {
+                            false
+                        } else if let Some(mut file) = file {
+                            read_file_part(&mut file, *file_offset, &mut page[..*read_bytes])
+                        } else {
+                            false
+                        }
                     }
-                    elf_load_ok = read_file_part(
-                        &mut file,
-                        chunk.file_offset,
-                        &mut page[chunk.page_offset..end],
-                    );
+                    PageMeta::Elf { chunks } => {
+                        // 从 userproc.bin 中分别读取各个片段，写入各自的页内位置
+                        let mut file = self.bin.clone();
+                        let mut elf_load_ok = true;
+                        for chunk in chunks {
+                            let end = chunk.page_offset + chunk.len;
+                            if end > PG_SIZE {
+                                elf_load_ok = false;
+                                break;
+                            }
+                            if !read_file_part(
+                                &mut file,
+                                chunk.file_offset,
+                                &mut page[chunk.page_offset..end],
+                            ) {
+                                elf_load_ok = false;
+                                break;
+                            }
+                        }
+                        elf_load_ok
+                    }
+                    PageMeta::Stack => false,
                 }
-                elf_load_ok
             }
-            PageMeta::Stack => false, // true还是false？
         };
 
         if !load_ok {
-            unsafe { UserPool::dealloc_pages(buf, 1) };
+            free_frame(pa);
             return false;
         }
 
-        let pa = PhysAddr::from(buf);
+        // 换入成功后释放不再需要的 swap slot
+        if let Some(slot) = swapped {
+            Swap::free_slot(slot);
+        }
 
         // 对页表加锁并更新为 valid（不能在关闭中断时进行 I/O，因此在这里统一加锁）
+        // 若页面来自 swap，说明内容已不同于原后备存储，置 D 位保留脏信息。
         let mut pg_table = pt.lock();
-        pg_table.map(pa, page_va, PG_SIZE, spt_entry.flags | PTEFlags::V);
+        let map_flags = if swapped.is_some() {
+            spt_entry.flags | PTEFlags::V | PTEFlags::D
+        } else {
+            spt_entry.flags | PTEFlags::V
+        };
+        pg_table.map(pa, page_va, PG_SIZE, map_flags);
         pg_table.activate();
         drop(pg_table);
 
         // 页面已经驻留内存，更新 SPT 状态
-        let mut pages = self.spt.lock();
-        if let Some(entry) = pages.get_mut(page_va) {
-            entry.state = PageState::Resident;
-        }
+        self.set_page_state(page_va, PageState::Resident);
+
+        // 加载完成，解除 pin，允许后续驱逐
+        unpin_frame(pa);
 
         true
     }
     pub fn munmap(&self, mapid: usize, pt: &Mutex<PageTable, Intr>) -> bool {
-        let _vm_guard = self.vm_lock.lock();
+        let _vm_guard = crate::mem::frame::VM_LOCK.lock();
         let mapping = {
             let mappings = self.mappings.lock();
 
@@ -508,13 +559,14 @@ impl UserProc {
                         // mmap 的有效 PTE 应当是用户叶子项
                         assert!(pte.is_leaf() && pte.is_user());
 
-                        let kernel_va = pte.pa().into_va();
+                        let pa = pte.pa();
+                        let kernel_va = pa.into_va();
                         let dirty = pte.is_dirty();
 
                         // 解除 VA -> PA 映射
                         pte.set_invalid();
 
-                        Some((kernel_va, dirty))
+                        Some((pa, kernel_va, dirty))
                     }
                     _ => None, // 尚未 Lazy Loaded
                 };
@@ -526,8 +578,8 @@ impl UserProc {
                 state
             }; // 这里释放 PageTable 锁
 
-            // 4. 只处理已驻留的物理页
-            if let Some((kernel_va, dirty)) = resident {
+            // 只处理已驻留的物理页
+            if let Some((pa, kernel_va, dirty)) = resident {
                 if dirty {
                     // 内核直接映射：物理页仍然有效
                     let buf =
@@ -544,9 +596,7 @@ impl UserProc {
                 }
 
                 // 即使写回失败，也继续回收资源
-                unsafe {
-                    UserPool::dealloc_pages(kernel_va as *mut u8, 1);
-                }
+                free_frame(pa);
             }
 
             // 从 SPT 中清除页面元数据
@@ -556,10 +606,10 @@ impl UserProc {
             va += PG_SIZE;
         }
 
-        if writeback_ok {
-            let mut mappings = self.mappings.lock();
-            mappings.remove(&mapid);
-        }
+        // 页面已经回收，无论写回是否成功都移除 Mapping；
+        // writeback_ok 仅作为本次写回是否成功的返回值。
+        let mut mappings = self.mappings.lock();
+        mappings.remove(&mapid);
 
         writeback_ok
     }
@@ -729,6 +779,9 @@ pub fn execute(mut file: File, argv: Vec<String>) -> isize {
 
     let tid = new_thread.id();
 
+    // 登记初始栈页的 Frame（init_user_stack 已急切分配并映射）
+    insert_frame(exec_info.stack_pa, new_thread.clone(), stack_bottom);
+
     child.tid.store(tid, Ordering::Release);
 
     // 登记子任务到parent
@@ -759,6 +812,15 @@ pub fn exit(value: isize) -> ! {
             proc.munmap(mapid, pt);
         }
     };
+
+    // 回收 ELF/栈页面换出时占用的 swap slot
+    let vm_guard = crate::mem::frame::VM_LOCK.lock();
+    proc.release_swap_slots();
+
+    // 移除本进程剩余（驻留）页面的 Frame 记录；
+    // 物理页随后由 Thread::drop -> PageTable::destroy 统一回收。
+    remove_frames_of(&current);
+    drop(vm_guard);
 
     let task = Arc::clone(&current.task);
     drop(current);

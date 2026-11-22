@@ -67,11 +67,24 @@ pub trait Vnode: Sync + Send {
 /// A file descriptor, binding with a [`Vnode`], that has
 /// independent position and permissions. It provides basic
 /// file I/O interface.
-#[derive(Clone)]
 pub struct File {
     vnode: Arc<dyn Vnode>,
     pos: usize,
     deny_write: bool,
+}
+
+impl Clone for File {
+    fn clone(&self) -> Self {
+        // 每个禁止写入的句柄都在 Drop 时释放一次计数。
+        if self.deny_write {
+            self.vnode.deny_write();
+        }
+        Self {
+            vnode: self.vnode.clone(),
+            pos: self.pos,
+            deny_write: self.deny_write,
+        }
+    }
 }
 
 impl File {

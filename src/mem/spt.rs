@@ -78,6 +78,11 @@ impl SupplementalPageTable {
         self.entries.get(&va.floor())
     }
 
+    /// 获取所有 SPT 项的克隆（供退出清理等一次性遍历使用）
+    pub fn snapshot(&self) -> alloc::vec::Vec<SptEntry> {
+        self.entries.values().cloned().collect()
+    }
+
     /// 修改页面状态
     pub fn get_mut(&mut self, va: usize) -> Option<&mut SptEntry> {
         self.entries.get_mut(&va.floor())

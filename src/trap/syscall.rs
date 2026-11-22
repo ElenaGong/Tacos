@@ -4,13 +4,12 @@
 #![allow(dead_code)]
 use crate::fs::disk::DISKFS;
 use crate::fs::File;
-use crate::mem::userbuf::{copy_to_user, read_user_cstr};
+use crate::mem::userbuf::{copy_to_user, fault_in_user_range, read_user_cstr};
 use crate::sbi::console::stdout;
 use crate::sbi::console_getchar;
 use crate::thread::current;
 use crate::{OsError, Result};
 
-use crate::mem::userbuf::user_range_writable;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -157,8 +156,8 @@ fn sys_read(fd: usize, buffer: *const u8, size: usize) -> isize {
     if fd == 1 || fd == 2 {
         return -1;
     }
-    // 在进行任何 I/O 前，检查整个用户缓冲区
-    if !user_range_writable(buffer as usize, size) {
+    // 在进行任何 I/O 前，让整个用户缓冲区驻留并检查写权限
+    if !fault_in_user_range(buffer as usize, size, true) {
         return -1;
     }
 
@@ -212,6 +211,10 @@ fn sys_read(fd: usize, buffer: *const u8, size: usize) -> isize {
 /// - 非负整数: 实际写入的字节数
 fn sys_write(fd: usize, user_src: *const u8, size: usize) -> isize {
     if fd == 0 || size > isize::MAX as usize {
+        return -1;
+    }
+    // 在进行任何 I/O 前，让整个用户缓冲区驻留并检查读权限
+    if !fault_in_user_range(user_src as usize, size, false) {
         return -1;
     }
     let mut buf = [0u8; 512];
@@ -338,6 +341,9 @@ fn sys_fstat(fd: usize, buf: *const u8) -> isize {
     stat[0..8].copy_from_slice(&(ino as u64).to_le_bytes());
     stat[8..16].copy_from_slice(&(size as u64).to_le_bytes());
 
+    if !fault_in_user_range(buf as usize, stat.len(), true) {
+        return -1;
+    }
     if copy_to_user(buf, &stat).is_err() {
         return -1;
     }

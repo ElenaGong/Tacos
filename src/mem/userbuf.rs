@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 use crate::error::OsError;
-use crate::mem::{get_pte, in_kernel_space, PG_SIZE};
+use crate::mem::mmap::FaultAccess;
+use crate::mem::{in_kernel_space, PG_SIZE};
+use crate::thread::current;
 use crate::Result;
 
 use alloc::string::String;
@@ -57,9 +59,31 @@ fn write_user_byte(user_src: *const u8, value: u8) -> Result<()> {
 /// - Ok(())：复制成功。
 /// - Err(())：地址无效或权限检查失败。
 pub fn copy_from_user(user_src: *const u8, dst: &mut [u8]) -> Result<()> {
-    for (i, byte) in dst.iter_mut().enumerate() {
-        let addr = (user_src as usize).checked_add(i).ok_or(OsError::BadPtr)? as *const u8;
-        *byte = read_user_byte(addr)?;
+    let start = user_src as usize;
+    start.checked_add(dst.len()).ok_or(OsError::BadPtr)?;
+    let mut done = 0usize;
+
+    while done < dst.len() {
+        let addr = start.checked_add(done).ok_or(OsError::BadPtr)?;
+        let page_va = addr & !(PG_SIZE - 1);
+        let page_off = addr & (PG_SIZE - 1);
+        let n = (dst.len() - done).min(PG_SIZE - page_off);
+
+        // 先让这一页驻留并检查读权限，再逐字节拷贝
+        if !fault_in_page(page_va, false) {
+            return Err(OsError::BadPtr);
+        }
+        let thread = current();
+        let table = thread.pagetable.as_ref().ok_or(OsError::BadPtr)?.lock();
+        if !table.get_pte(page_va).is_some_and(|pte| pte.is_valid()) {
+            continue;
+        }
+        for i in 0..n {
+            let byte_addr = addr.checked_add(i).ok_or(OsError::BadPtr)? as *const u8;
+            dst[done + i] = read_user_byte(byte_addr)?;
+        }
+
+        done += n;
     }
     Ok(())
 }
@@ -72,9 +96,31 @@ pub fn copy_from_user(user_src: *const u8, dst: &mut [u8]) -> Result<()> {
 /// - Ok(())
 /// - Err(())
 pub fn copy_to_user(user_dst: *const u8, src: &[u8]) -> Result<()> {
-    for (i, &byte) in src.iter().enumerate() {
-        let addr = (user_dst as usize).checked_add(i).ok_or(OsError::BadPtr)? as *const u8;
-        write_user_byte(addr, byte)?;
+    let start = user_dst as usize;
+    start.checked_add(src.len()).ok_or(OsError::BadPtr)?;
+    let mut done = 0usize;
+
+    while done < src.len() {
+        let addr = start.checked_add(done).ok_or(OsError::BadPtr)?;
+        let page_va = addr & !(PG_SIZE - 1);
+        let page_off = addr & (PG_SIZE - 1);
+        let n = (src.len() - done).min(PG_SIZE - page_off);
+
+        // 先让这一页驻留并检查写权限，再逐字节写入
+        if !fault_in_page(page_va, true) {
+            return Err(OsError::BadPtr);
+        }
+        let thread = current();
+        let table = thread.pagetable.as_ref().ok_or(OsError::BadPtr)?.lock();
+        if !table.get_pte(page_va).is_some_and(|pte| pte.is_valid()) {
+            continue;
+        }
+        for i in 0..n {
+            let byte_addr = addr.checked_add(i).ok_or(OsError::BadPtr)? as *const u8;
+            write_user_byte(byte_addr, src[done + i])?;
+        }
+
+        done += n;
     }
     Ok(())
 }
@@ -110,47 +156,68 @@ pub fn read_user_cstr(addr: usize) -> Option<String> {
     }
     None
 }
-/// 检查当前进程的用户虚拟地址区间 [addr, addr + len)
-/// 是否全部映射为用户可写页面。
-pub fn user_range_writable(addr: usize, len: usize) -> bool {
-    if len == 0 {
-        return true;
-    }
-
-    // 计算最后一个字节，防止整数溢出
-    let Some(last) = addr.checked_add(len - 1) else {
+/// 让指定虚拟页驻留（懒加载或换入），并检查访问权限。
+fn fault_in_page(page_va: usize, write: bool) -> bool {
+    let thread = current();
+    let Some(userproc) = thread.userproc.as_ref() else {
+        return false;
+    };
+    let Some(pt) = thread.pagetable.as_ref() else {
         return false;
     };
 
-    // 排除内核地址
-    if in_kernel_space(addr) || in_kernel_space(last) {
-        return false;
-    }
-
-    // Sv39 低半区的规范用户地址范围
-    const USER_LIMIT: usize = 1usize << 38;
-
-    if last >= USER_LIMIT {
-        return false;
-    }
-
-    // 找到覆盖范围中的第一个和最后一个虚拟页号
-    let first_page = addr / PG_SIZE;
-    let last_page = last / PG_SIZE;
-
-    for page in first_page..=last_page {
-        let va = page * PG_SIZE;
-
-        let Some(pte) = get_pte(va) else {
+    if userproc.find_page(page_va).is_none() {
+        let sp = userproc.user_sp.load(core::sync::atomic::Ordering::Relaxed);
+        if page_va < (sp & !(PG_SIZE - 1)) {
             return false;
-        };
-
-        if !pte.is_valid() || !pte.is_leaf() || !pte.is_user() || !pte.is_rwable() {
+        }
+        if !crate::trap::pagefault::grow_stack(sp, page_va.max(sp)) {
             return false;
         }
     }
+    let Some(entry) = userproc.find_page(page_va) else {
+        return false;
+    };
+    let access = if write {
+        FaultAccess::Write
+    } else {
+        FaultAccess::Read
+    };
+    if !entry.allows(access) {
+        return false;
+    }
 
+    userproc.lazily_load_page(page_va, pt)
+}
+
+/// 让 [start, start + len) 覆盖的所有虚拟页驻留，并检查访问权限。
+fn fault_in_range(start: usize, len: usize, write: bool) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+
+    let mut va = start & !(PG_SIZE - 1);
+    while va < end {
+        if !fault_in_page(va, write) {
+            return false;
+        }
+        va += PG_SIZE;
+    }
     true
+}
+
+/// 系统调用访问用户缓冲前，先让范围内的页面驻留并检查权限。
+pub fn fault_in_user_range(addr: usize, len: usize, write: bool) -> bool {
+    fault_in_range(addr, len, write)
+}
+
+/// 检查当前进程的用户虚拟地址区间 [addr, addr + len)
+/// 是否全部可写（会顺带把未驻留页加载/换入）。
+pub fn user_range_writable(addr: usize, len: usize) -> bool {
+    fault_in_user_range(addr, len, true)
 }
 
 extern "C" {

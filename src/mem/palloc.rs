@@ -55,6 +55,11 @@ impl BuddyAllocator {
 
     /// Allocate n pages and returns the virtual address.
     unsafe fn alloc(&mut self, n: usize) -> *mut u8 {
+        self.try_alloc(n).expect("memory is exhausted")
+    }
+
+    /// Allocate n pages; return None when memory is exhausted.
+    unsafe fn try_alloc(&mut self, n: usize) -> Option<*mut u8> {
         assert!(n <= 1 << MAX_ORDER, "request is too large");
 
         let order = n.next_power_of_two().trailing_zeros() as usize;
@@ -72,11 +77,11 @@ impl BuddyAllocator {
                     }
                 }
                 self.allocated += 1 << order;
-                return self.free_lists[order].pop().unwrap().cast();
+                return Some(self.free_lists[order].pop().unwrap().cast());
             }
         }
 
-        unreachable!("memory is exhausted");
+        None
     }
 
     /// Deallocate a chunk of pages
@@ -148,6 +153,11 @@ impl UserPool {
     /// Allocate n pages of consecutive space
     pub unsafe fn alloc_pages(n: usize) -> *mut u8 {
         Self::instance().lock().alloc(n)
+    }
+
+    /// Allocate n pages of consecutive space; return None on exhaustion.
+    pub unsafe fn try_alloc_pages(n: usize) -> Option<*mut u8> {
+        Self::instance().lock().try_alloc(n)
     }
 
     /// Free n pages of memory starting at `ptr`

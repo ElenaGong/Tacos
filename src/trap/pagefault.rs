@@ -1,4 +1,4 @@
-use crate::mem::palloc::UserPool;
+use crate::mem::frame::{alloc_frame, free_frame, unpin_frame};
 use crate::mem::userbuf::{
     __knrl_read_usr_byte_pc, __knrl_read_usr_exit, __knrl_write_usr_byte_pc, __knrl_write_usr_exit,
 };
@@ -8,21 +8,11 @@ use mem::mmap::FaultAccess;
 // use crate::thread::{self};
 use crate::trap::Frame;
 use crate::userproc;
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use riscv::register::scause::Exception::{self, *};
 use riscv::register::sstatus::{self, SPP};
-
-fn alloc_user_page(va: usize, pg_table: &mut PageTable, flags: PTEFlags) -> Option<PhysAddr> {
-    let page = unsafe { UserPool::alloc_pages(1) };
-    unsafe {
-        core::ptr::write_bytes(page, 0, PG_SIZE);
-    }
-    let pa = PhysAddr::from(page);
-    pg_table.map(pa, va, PG_SIZE, flags);
-
-    Some(pa)
-}
 
 /// 用户态缺页处理结果
 enum FaultError {
@@ -37,9 +27,11 @@ fn try_grow_stack(frame: &Frame, fault: Exception, addr: usize) -> bool {
         return false;
     }
 
-    // 获取用户态 SP
-    let sp = frame.x[2];
+    grow_stack(frame.x[2], addr)
+}
 
+pub(crate) fn grow_stack(sp: usize, addr: usize) -> bool {
+    let _vm_guard = crate::mem::frame::VM_LOCK.lock();
     // 获取当前进程的 stack_bottom
     let current_thread = current();
 
@@ -69,32 +61,42 @@ fn try_grow_stack(frame: &Frame, fault: Exception, addr: usize) -> bool {
     let Some(pt) = current_thread.pagetable.as_ref() else {
         return false;
     };
-    let mut table = pt.lock();
-    // 从 UserPool 分配页面并建立页表映射
     let flags = PTEFlags::V | PTEFlags::R | PTEFlags::W | PTEFlags::U;
 
+    // 先分配物理页并登记 Frame（不持有页表锁，避免 Intr -> Sleep 的锁序问题）
+    let mut frames: Vec<(PhysAddr, usize)> = Vec::new();
     let mut va = page_floor;
-
     while va < st_bottom {
-        let Some(_pa) = alloc_user_page(va, &mut table, flags) else {
+        let Some(pa) = alloc_frame(current_thread.clone(), va) else {
+            for (pa, _) in &frames {
+                free_frame(*pa);
+            }
             return false;
         };
+        // 栈页需要清零
+        unsafe {
+            core::ptr::write_bytes(pa.into_va() as *mut u8, 0, PG_SIZE);
+        }
+        frames.push((pa, va));
         va += PG_SIZE;
+    }
+
+    // 建立 VA -> PA 映射并刷新 TLB
+    let mut table = pt.lock();
+    for (pa, va) in &frames {
+        table.map(*pa, *va, PG_SIZE, flags);
     }
     // 更新 stack_bottom
     userproc.stack_bottom.store(page_floor, Ordering::Relaxed);
-
-    // 刷新 TLB
     table.activate();
     drop(table);
 
-    // 分配新页后登记 PageMeta::Stack，状态为 Resident
-    let mut va = page_floor;
-    while va < st_bottom {
-        if !userproc.register_stack_page(va) {
-            return false;
-        }
-        va += PG_SIZE;
+    // 元数据完成后才允许驱逐。
+    for (_, va) in &frames {
+        assert!(userproc.register_stack_page(*va));
+    }
+    for (pa, _) in &frames {
+        unpin_frame(*pa);
     }
 
     true

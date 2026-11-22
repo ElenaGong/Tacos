@@ -4,8 +4,8 @@ use elf_rs::{Elf, ElfFile, ProgramHeaderEntry, ProgramHeaderFlags, ProgramType};
 
 use crate::fs::File;
 use crate::io::prelude::*;
+use crate::mem::frame::alloc_user_page;
 use crate::mem::pagetable::{PTEFlags, PageTable};
-use crate::mem::palloc::UserPool;
 use crate::mem::spt::PageState::Unloaded;
 use crate::mem::spt::{ElfChunk, PageMeta, SptEntry, SupplementalPageTable};
 use crate::mem::{PageAlign, PhysAddr, PG_SIZE};
@@ -16,6 +16,7 @@ use crate::{OsError, Result};
 pub(super) struct ExecInfo {
     pub entry_point: usize,
     pub init_sp: usize,
+    pub stack_pa: PhysAddr,
 }
 
 /// Loads an executable file
@@ -32,10 +33,10 @@ pub(super) fn load_executable(
     pt: &mut PageTable,
     spt: &mut SupplementalPageTable,
 ) -> Result<ExecInfo> {
-    let exec_info = load_elf(file, spt)?;
+    let mut exec_info = load_elf(file, spt)?;
 
     // Initialize user stack.
-    init_user_stack(pt, exec_info.init_sp);
+    exec_info.stack_pa = init_user_stack(pt, exec_info.init_sp)?;
 
     // Forbid modifying executable file when running
     file.deny_write();
@@ -65,6 +66,7 @@ fn load_elf(file: &mut File, spt: &mut SupplementalPageTable) -> Result<ExecInfo
     Ok(ExecInfo {
         entry_point: elf.elf_header().entry_point() as _,
         init_sp: 0x80500000,
+        stack_pa: PhysAddr::from_pa(0),
     })
 }
 
@@ -146,12 +148,14 @@ fn load_segment(phdr: &ProgramHeaderEntry, pagetable: &mut SupplementalPageTable
 }
 
 /// Initializes the user stack.
-fn init_user_stack(pagetable: &mut PageTable, init_sp: usize) {
+fn init_user_stack(pagetable: &mut PageTable, init_sp: usize) -> Result<PhysAddr> {
     assert!(init_sp % PG_SIZE == 0, "initial sp address misaligns");
 
-    // Allocate a page from UserPool as user stack.
-    let stack_va = unsafe { UserPool::alloc_pages(1) };
-    let stack_pa = PhysAddr::from(stack_va);
+    // Allocate a page from UserPool as user stack（可失败，避免耗尽时 panic）。
+    let _vm_guard = crate::mem::frame::VM_LOCK.lock();
+    let stack_pa = alloc_user_page().ok_or(UserError)?;
+    let stack_va = stack_pa.into_va() as *mut u8;
+    unsafe { core::ptr::write_bytes(stack_va, 0, PG_SIZE) };
 
     // Get the start address of stack page
     let stack_page_begin = PageAlign::floor(init_sp - 1);
@@ -166,4 +170,6 @@ fn init_user_stack(pagetable: &mut PageTable, init_sp: usize) {
         stack_va,
         stack_page_begin
     );
+
+    Ok(stack_pa)
 }

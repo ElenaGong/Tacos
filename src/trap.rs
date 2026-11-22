@@ -1,7 +1,7 @@
 //! Trap handler
 //!
 
-mod pagefault;
+pub(crate) mod pagefault;
 mod syscall;
 
 use crate::device::{plic, virtio};
@@ -66,6 +66,10 @@ pub extern "C" fn trap_handler(frame: &mut Frame) {
             unsafe { riscv::register::sstatus::set_sie() };
             // Increase sepc by 1 to skip ecall.
             frame.sepc += 4;
+            if let Some(proc) = thread::current().userproc.as_ref() {
+                proc.user_sp
+                    .store(frame.x[2], core::sync::atomic::Ordering::Relaxed);
+            }
             frame.x[10] = syscall::syscall_handler(id, args) as usize;
         }
 
