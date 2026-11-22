@@ -61,6 +61,7 @@ pub struct UserProc {
     mappings: Mutex<BTreeMap<usize, Mapping>, Sleep>,
     next_mapid: AtomicUsize,
     pub stack_bottom: AtomicUsize,
+    vm_lock: Mutex<(), Sleep>,
 }
 
 impl UserProc {
@@ -72,6 +73,7 @@ impl UserProc {
             mappings: Mutex::new(BTreeMap::new()),
             next_mapid: AtomicUsize::new(1),
             stack_bottom: AtomicUsize::new(STACK_TOP - PG_SIZE),
+            vm_lock: Mutex::new(()),
         }
     }
 
@@ -226,6 +228,7 @@ impl UserProc {
 
     /// mmap
     pub fn mmap(&self, fd: usize, addr: usize) -> isize {
+        let _vm_guard = self.vm_lock.lock();
         if fd < 3 || addr == 0 || !addr.is_aligned() {
             return -1;
         }
@@ -331,6 +334,7 @@ impl UserProc {
     }
 
     pub fn load_mmap_page(&self, addr: usize, pt: &Mutex<PageTable, Intr>) -> bool {
+        let _vm_guard = self.vm_lock.lock();
         let page_va = addr.floor();
         let pg_table = pt.lock();
         if let Some(entry) = pg_table.get_pte(page_va) {
@@ -351,7 +355,7 @@ impl UserProc {
         };
 
         // 打开指定文件并用seek定位到offset处
-        let mut file = mapping.openfile.file;
+        let mut file = mapping.openfile.file.clone();
         let buf = unsafe { UserPool::alloc_pages(1) };
         let page = unsafe { (buf as *mut [u8; PG_SIZE]).as_mut().unwrap() };
         let file_offset = mmap_page.file_offset;
@@ -381,6 +385,96 @@ impl UserProc {
         pg_table.activate();
 
         true
+    }
+    pub fn munmap(&self, mapid: usize, pt: &Mutex<PageTable, Intr>) -> bool {
+        let _vm_guard = self.vm_lock.lock();
+        let mapping = {
+            let mappings = self.mappings.lock();
+
+            let Some(mapping) = mappings.get(&mapid) else {
+                return false;
+            };
+
+            mapping.clone()
+        }; // 锁在这里释放
+
+        let mut file = mapping.openfile.file;
+
+        let mut va = mapping.start;
+        let n_pages = (mapping.length / PG_SIZE) + usize::from(mapping.length % PG_SIZE != 0);
+
+        let mut writeback_ok = true;
+
+        // 对mapping的每一页，检查是否有PTE，
+        for _i in 0..n_pages {
+            let Some(page) = self.find_mmap(va) else {
+                return false;
+            };
+            let file_offset = page.file_offset;
+            let write_bytes = page.read_bytes;
+
+            let resident = {
+                let mut pg_table = pt.lock();
+
+                let state = match pg_table.get_pte_mut(va) {
+                    Some(pte) if pte.is_valid() => {
+                        // mmap 的有效 PTE 应当是用户叶子项
+                        assert!(pte.is_leaf() && pte.is_user());
+
+                        let kernel_va = pte.pa().into_va();
+                        let dirty = pte.is_dirty();
+
+                        // 解除 VA -> PA 映射
+                        pte.set_invalid();
+
+                        Some((kernel_va, dirty))
+                    }
+                    _ => None, // 尚未 Lazy Loaded
+                };
+
+                if state.is_some() {
+                    pg_table.activate(); // 刷新本 hart 的 TLB
+                }
+
+                state
+            }; // 这里释放 PageTable 锁
+
+            // 4. 只处理已驻留的物理页
+            if let Some((kernel_va, dirty)) = resident {
+                if dirty {
+                    // 内核直接映射：物理页仍然有效
+                    let buf =
+                        unsafe { core::slice::from_raw_parts(kernel_va as *const u8, write_bytes) };
+
+                    // 文件 I/O 不持有 PageTable 锁
+                    let result = file
+                        .seek(SeekFrom::Start(file_offset))
+                        .and_then(|_| file.write_all(buf));
+
+                    if result.is_err() {
+                        writeback_ok = false;
+                    }
+                }
+
+                // 即使写回失败，也继续回收资源
+                unsafe {
+                    UserPool::dealloc_pages(kernel_va as *mut u8, 1);
+                }
+            }
+
+            // 从pages中清除页面元数据
+            let mut pages = self.pages.lock();
+            pages.remove(&va);
+
+            va += PG_SIZE;
+        }
+
+        if writeback_ok {
+            let mut mappings = self.mappings.lock();
+            mappings.remove(&mapid);
+        }
+
+        writeback_ok
     }
 }
 
@@ -551,10 +645,22 @@ pub fn execute(mut file: File, argv: Vec<String>) -> isize {
 pub fn exit(value: isize) -> ! {
     // 检查是否拥有用户进程
     let current = thread::current();
-    let _proc = current
+    let proc = current
         .userproc
         .as_ref()
         .expect("Current thread has no user process");
+
+    if let Some(pt) = current.pagetable.as_ref() {
+        // let mut unmap_ok = true;
+        let mapids: Vec<usize> = {
+            let mappings = proc.mappings.lock();
+            let keys = mappings.keys();
+            keys.cloned().collect()
+        };
+        for mapid in mapids {
+            proc.munmap(mapid, pt);
+        }
+    };
 
     let task = Arc::clone(&current.task);
     drop(current);

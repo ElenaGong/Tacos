@@ -15,7 +15,11 @@ pub struct Mapping {
     pub length: usize,
     pub flags: PTEFlags,
 }
-
+// pub struct MmapPage {
+//     mapid: usize,       // 由mapid能找到Mapping
+//     file_offset: usize, // 找到该页从文件中的什么地方开始
+//     read_bytes: usize,  // 如果等于PG_SIZE就为一整页；小于就用0补齐
+// }
 impl Mapping {
     pub fn allow(&self, access: FaultAccess) -> bool {
         match access {

@@ -394,6 +394,18 @@ fn sys_mmap(fd: usize, addr: usize) -> isize {
     proc.mmap(fd, addr)
 }
 
+fn sys_munmap(mapid: usize) -> bool {
+    let thread = current();
+    let Some(proc) = thread.userproc.as_ref() else {
+        return false;
+    };
+    let Some(pt) = thread.pagetable.as_ref() else {
+        return false;
+    };
+
+    proc.munmap(mapid, pt)
+}
+
 pub fn syscall_handler(id: usize, args: [usize; 3]) -> isize {
     // TODO: LAB2 impl
     match id {
@@ -437,6 +449,10 @@ pub fn syscall_handler(id: usize, args: [usize; 3]) -> isize {
         SYS_TELL => sys_tell(args[0]),
         SYS_REMOVE => sys_remove(args[0] as *const u8),
         SYS_MMAP => sys_mmap(args[0] as usize, args[1] as usize),
+        SYS_MUNMAP => match sys_munmap(args[0] as usize) {
+            true => 0,
+            false => -1,
+        },
         _ => -1,
     }
 }

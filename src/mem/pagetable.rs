@@ -87,6 +87,26 @@ impl PageTable {
         })
     }
 
+    /// 查找虚拟地址对应的可变 PTE
+    pub fn get_pte_mut(&mut self, va: usize) -> Option<&mut Entry> {
+        let mut table = self.entries.as_mut_ptr();
+
+        // Sv39: Level 2 -> Level 1
+        for level in (1..=2).rev() {
+            let entry = unsafe { &*table.add(Self::px(level, va)) };
+
+            // 中间页表不存在，或遇到了叶子 PTE
+            if !entry.is_valid() || entry.is_leaf() {
+                return None;
+            }
+
+            // 转到下一级页表
+            table = entry.pa().into_va() as *mut Entry;
+        }
+
+        // Level 0: 返回最终 PTE 的可变引用
+        Some(unsafe { &mut *table.add(Self::px(0, va)) })
+    }
     /// Free all memory used by this pagetable back to where they were allocated.
     pub unsafe fn destroy(&mut self) {
         unsafe fn destroy_imp(pgt: &mut PageTable, level: usize) {
