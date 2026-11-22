@@ -8,6 +8,7 @@ use crate::io::{Read, Seek, SeekFrom, Write};
 use crate::mem::mmap::Mapping;
 use crate::mem::pagetable::{KernelPgTable, PageTable};
 use crate::mem::palloc::UserPool;
+use crate::mem::spt::{PageMeta, PageState, SptEntry, SupplementalPageTable};
 use crate::mem::{PTEFlags, PageAlign, PhysAddr, PG_SIZE};
 use crate::sbi::shutdown;
 use crate::sync::Intr;
@@ -19,7 +20,6 @@ use crate::trap::{trap_exit_u, Frame};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::mem::MaybeUninit;
@@ -43,21 +43,28 @@ impl OpenFile {
     }
 }
 
-/// 记录被mmap的页的元数据
-#[derive(Clone)]
-pub struct MmapPage {
-    mapid: usize,       // 由mapid能找到Mapping
-    file_offset: usize, // 找到该页从文件中的什么地方开始
-    read_bytes: usize,  // 如果等于PG_SIZE就为一整页；小于就用0补齐
+/// 从指定文件偏移读取到目标缓冲区
+fn read_file_part(file: &mut File, offset: usize, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+
+    file.seek(SeekFrom::Start(offset)).is_ok() && file.read_exact(dst).is_ok()
 }
 
-impl MmapPage {}
+/// 记录被mmap的页的元数据
+// #[derive(Clone)]
+// pub struct MmapPage {
+//     mapid: usize,       // 由mapid能找到Mapping
+//     file_offset: usize, // 找到该页从文件中的什么地方开始
+//     read_bytes: usize,  // 如果等于PG_SIZE就为一整页；小于就用0补齐
+// }
 
 pub struct UserProc {
     #[allow(dead_code)]
     bin: File,
     fd_table: Mutex<BTreeMap<usize, OpenFile>, Sleep>,
-    pages: Mutex<BTreeMap<usize, MmapPage>, Sleep>,
+    spt: Mutex<SupplementalPageTable, Sleep>,
     mappings: Mutex<BTreeMap<usize, Mapping>, Sleep>,
     next_mapid: AtomicUsize,
     pub stack_bottom: AtomicUsize,
@@ -65,11 +72,11 @@ pub struct UserProc {
 }
 
 impl UserProc {
-    pub fn new(file: File) -> Self {
+    pub fn new(file: File, spt: SupplementalPageTable) -> Self {
         Self {
             bin: file,
             fd_table: Mutex::new(BTreeMap::new()),
-            pages: Mutex::new(BTreeMap::new()),
+            spt: Mutex::new(spt.clone()),
             mappings: Mutex::new(BTreeMap::new()),
             next_mapid: AtomicUsize::new(1),
             stack_bottom: AtomicUsize::new(STACK_TOP - PG_SIZE),
@@ -175,19 +182,32 @@ impl UserProc {
     }
 
     pub fn not_mapped(&self, start: usize, end: usize) -> bool {
-        let maps = self.mappings.lock();
-
         // 与已有 mmap 区间检查冲突
-        for mapping in maps.values() {
-            let pages = mapping.length / PG_SIZE + usize::from(mapping.length % PG_SIZE != 0);
-            let old_end = mapping.start + pages * PG_SIZE;
+        {
+            let maps = self.mappings.lock();
+            for mapping in maps.values() {
+                let pages = mapping.length / PG_SIZE + usize::from(mapping.length % PG_SIZE != 0);
+                let old_end = mapping.start + pages * PG_SIZE;
 
-            if start < old_end && mapping.start < end {
-                return false;
+                if start < old_end && mapping.start < end {
+                    return false;
+                }
             }
         }
 
-        // 与已存在的页表映射检查冲突
+        // 与 SPT 中已登记的页面检查冲突（ELF 段、mmap 页、栈页）
+        {
+            let pages = self.spt.lock();
+            let mut va = start;
+            while va < end {
+                if pages.get(va).is_some() {
+                    return false;
+                }
+                va += PG_SIZE;
+            }
+        }
+
+        // 与已存在的页表映射检查冲突（例如尚未登记进 SPT 的已增长栈页）
         let thread = current();
         let Some(pt) = thread.pagetable.as_ref() else {
             return false;
@@ -206,19 +226,38 @@ impl UserProc {
         true
     }
 
-    fn find_mmap(&self, va: usize) -> Option<MmapPage> {
-        let pages = self.pages.lock();
-        let Some(mmap_page) = pages.get(&va) else {
+    /// 把一页增长出来的栈页登记进 SPT（页面已经驻留内存）
+    pub fn register_stack_page(&self, va: usize) -> bool {
+        let entry = SptEntry {
+            meta: PageMeta::Stack,
+            state: PageState::Resident,
+            flags: PTEFlags::V | PTEFlags::R | PTEFlags::W | PTEFlags::U,
+        };
+        let mut pages = self.spt.lock();
+        pages.insert(va, entry)
+    }
+
+    pub fn find_page(&self, va: usize) -> Option<SptEntry> {
+        let pages = self.spt.lock();
+        let Some(entry) = pages.get(va) else {
             return None;
         };
-        Some(mmap_page.clone())
+        Some(entry.clone())
     }
 
     pub fn find_mapping(&self, va: usize) -> Option<Mapping> {
-        let Some(mmap_page) = self.find_mmap(va) else {
+        let Some(entry) = self.find_page(va) else {
             return None;
         };
-        let mapid = mmap_page.mapid;
+        let mapid = {
+            match entry.meta {
+                PageMeta::Mmap { mapid, .. } => mapid,
+                _ => {
+                    return None;
+                }
+            }
+        };
+
         let maps = self.mappings.lock();
         let Some(mapping) = maps.get(&mapid) else {
             return None;
@@ -286,13 +325,14 @@ impl UserProc {
             true => PTEFlags::W,
             false => PTEFlags::empty(),
         };
+        let flags = flag_r | flag_w | PTEFlags::U;
         maps.insert(
             mapid,
             Mapping {
                 openfile: file,
                 start: addr,
                 length: file_len,
-                flags: flag_r | flag_w | PTEFlags::U,
+                flags: flags,
                 // 暂时不设为valid是因为懒加载；load时需要补上
             },
         );
@@ -304,7 +344,7 @@ impl UserProc {
         let mut va = addr;
         let mut file_offset = 0;
 
-        let mut pages = self.pages.lock();
+        let mut pages = self.spt.lock();
 
         while pg_number < n_pages {
             let mut read_bytes = PG_SIZE;
@@ -313,10 +353,14 @@ impl UserProc {
             }
             pages.insert(
                 va,
-                MmapPage {
-                    mapid: mapid,
-                    file_offset: file_offset,
-                    read_bytes: read_bytes,
+                SptEntry {
+                    meta: PageMeta::Mmap {
+                        mapid: mapid,
+                        file_offset: file_offset,
+                        read_bytes: read_bytes,
+                    },
+                    state: PageState::Unloaded,
+                    flags: flags,
                 },
             );
 
@@ -333,56 +377,93 @@ impl UserProc {
         mapid as isize
     }
 
-    pub fn load_mmap_page(&self, addr: usize, pt: &Mutex<PageTable, Intr>) -> bool {
+    pub fn lazily_load_page(&self, addr: usize, pt: &Mutex<PageTable, Intr>) -> bool {
         let _vm_guard = self.vm_lock.lock();
         let page_va = addr.floor();
+
         let pg_table = pt.lock();
         if let Some(entry) = pg_table.get_pte(page_va) {
             if entry.is_valid() {
-                return true;
+                return true; //应该true还是false？
             }
         }
         drop(pg_table);
 
-        // 把磁盘中的文件的指定部分加载到页中，
-        // 获取mmap_page和mapping
-
-        let Some(mmap_page) = self.find_mmap(page_va) else {
-            return false;
+        // 取出该页的元数据（克隆一份，避免在文件 I/O 期间持有 spt 锁）
+        let spt_entry = {
+            let pages = self.spt.lock();
+            let Some(entry) = pages.get(page_va) else {
+                return false;
+            };
+            entry.clone()
         };
-        let Some(mapping) = self.find_mapping(page_va) else {
-            return false;
-        };
 
-        // 打开指定文件并用seek定位到offset处
-        let mut file = mapping.openfile.file.clone();
+        if !matches!(spt_entry.state, PageState::Unloaded) {
+            return false;
+        }
+
+        // 分配物理页并先清零
         let buf = unsafe { UserPool::alloc_pages(1) };
         let page = unsafe { (buf as *mut [u8; PG_SIZE]).as_mut().unwrap() };
-        let file_offset = mmap_page.file_offset;
-        let read_bytes = mmap_page.read_bytes;
+        page.fill(0);
 
-        let Ok(_pos) = file.seek(SeekFrom::Start(file_offset)) else {
-            return false;
+        let load_ok = match &spt_entry.meta {
+            PageMeta::Mmap {
+                mapid,
+                file_offset,
+                read_bytes,
+            } => {
+                let file = {
+                    let mappings = self.mappings.lock();
+                    mappings.get(mapid).map(|m| m.openfile.file.clone())
+                };
+
+                if *read_bytes > PG_SIZE {
+                    false
+                } else if let Some(mut file) = file {
+                    read_file_part(&mut file, *file_offset, &mut page[..*read_bytes])
+                } else {
+                    false
+                }
+            }
+            PageMeta::Elf { chunks } => {
+                // 从 userproc.bin 中分别读取各个片段，写入各自的页内位置
+                let mut file = self.bin.clone();
+                let mut elf_load_ok = true;
+                for chunk in chunks {
+                    let end = chunk.page_offset + chunk.len;
+                    if end > PG_SIZE {
+                        return false;
+                    }
+                    elf_load_ok = read_file_part(
+                        &mut file,
+                        chunk.file_offset,
+                        &mut page[chunk.page_offset..end],
+                    );
+                }
+                elf_load_ok
+            }
+            PageMeta::Stack => false, // true还是false？
         };
 
-        let mut filebuf = vec![0u8; read_bytes];
-
-        // 将read_bytes长度的文件片段读到filebuf中
-        let Ok(_bytes) = file.read_exact(&mut filebuf) else {
+        if !load_ok {
+            unsafe { UserPool::dealloc_pages(buf, 1) };
             return false;
-        };
-        // 再读到指定物理页，并用0补齐
-        page[..read_bytes].copy_from_slice(&filebuf);
-        page[read_bytes..].fill(0);
+        }
 
         let pa = PhysAddr::from(buf);
 
-        // 对页表加锁并更新valid（注意，因为不能在关闭中断时进行I/O，所以在这里统一进行）
+        // 对页表加锁并更新为 valid（不能在关闭中断时进行 I/O，因此在这里统一加锁）
         let mut pg_table = pt.lock();
-
-        // 建立物理页映射并更新页表项为valid
-        pg_table.map(pa, page_va, PG_SIZE, mapping.flags | PTEFlags::V);
+        pg_table.map(pa, page_va, PG_SIZE, spt_entry.flags | PTEFlags::V);
         pg_table.activate();
+        drop(pg_table);
+
+        // 页面已经驻留内存，更新 SPT 状态
+        let mut pages = self.spt.lock();
+        if let Some(entry) = pages.get_mut(page_va) {
+            entry.state = PageState::Resident;
+        }
 
         true
     }
@@ -407,11 +488,17 @@ impl UserProc {
 
         // 对mapping的每一页，检查是否有PTE，
         for _i in 0..n_pages {
-            let Some(page) = self.find_mmap(va) else {
+            let Some(page) = self.find_page(va) else {
                 return false;
             };
-            let file_offset = page.file_offset;
-            let write_bytes = page.read_bytes;
+            let (file_offset, write_bytes) = match page.meta {
+                PageMeta::Mmap {
+                    file_offset,
+                    read_bytes,
+                    ..
+                } => (file_offset, read_bytes),
+                _ => return false,
+            };
 
             let resident = {
                 let mut pg_table = pt.lock();
@@ -462,9 +549,9 @@ impl UserProc {
                 }
             }
 
-            // 从pages中清除页面元数据
-            let mut pages = self.pages.lock();
-            pages.remove(&va);
+            // 从 SPT 中清除页面元数据
+            let mut pages = self.spt.lock();
+            pages.remove(va);
 
             va += PG_SIZE;
         }
@@ -531,8 +618,9 @@ pub fn execute(mut file: File, argv: Vec<String>) -> isize {
     // to access kernel code and data during syscall without the need to
     // switch pagetables.
     let mut pt = KernelPgTable::clone();
+    let mut spt = SupplementalPageTable::new();
 
-    let exec_info = match load::load_executable(&mut file, &mut pt) {
+    let exec_info = match load::load_executable(&mut file, &mut pt, &mut spt) {
         Ok(x) => x,
         Err(_) => unsafe {
             pt.destroy();
@@ -546,11 +634,21 @@ pub fn execute(mut file: File, argv: Vec<String>) -> isize {
     frame.x[2] = exec_info.init_sp;
 
     // Here the new process will be created.
-    let userproc = UserProc::new(file);
-
-    // ---------- (Lab2) Pass arguments to user program ------------
     let stack_top = exec_info.init_sp;
     let stack_bottom = stack_top - PG_SIZE;
+
+    let spt_entry = SptEntry {
+        meta: PageMeta::Stack,
+        state: PageState::Resident,
+        flags: PTEFlags::V | PTEFlags::R | PTEFlags::W | PTEFlags::U,
+    };
+    if !spt.insert(stack_bottom, spt_entry) {
+        return -1;
+    };
+
+    let userproc = UserProc::new(file, spt);
+
+    // ---------- (Lab2) Pass arguments to user program ------------
     let mut cursor = stack_top;
 
     // 把单词推到栈上，记录每个词的首地址指针

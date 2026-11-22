@@ -60,8 +60,8 @@ fn try_grow_stack(frame: &Frame, fault: Exception, addr: usize) -> bool {
         return false;
     }
 
-    // 检查所有待分配页面是否存在映射冲突（包括PTE中已分配的页和已经被mmap映射的页）
-    if !userproc.not_mapped(page_floor, page_floor + PG_SIZE) {
+    // 检查所有待分配页面是否存在映射冲突（包括 SPT 中已登记的页、PTE 中已分配的页和已经被 mmap 映射的页）
+    if !userproc.not_mapped(page_floor, st_bottom) {
         return false;
     }
 
@@ -70,7 +70,7 @@ fn try_grow_stack(frame: &Frame, fault: Exception, addr: usize) -> bool {
         return false;
     };
     let mut table = pt.lock();
-    // 从UserPool分配页面并建立页表映射
+    // 从 UserPool 分配页面并建立页表映射
     let flags = PTEFlags::V | PTEFlags::R | PTEFlags::W | PTEFlags::U;
 
     let mut va = page_floor;
@@ -86,6 +86,16 @@ fn try_grow_stack(frame: &Frame, fault: Exception, addr: usize) -> bool {
 
     // 刷新 TLB
     table.activate();
+    drop(table);
+
+    // 分配新页后登记 PageMeta::Stack，状态为 Resident
+    let mut va = page_floor;
+    while va < st_bottom {
+        if !userproc.register_stack_page(va) {
+            return false;
+        }
+        va += PG_SIZE;
+    }
 
     true
 }
@@ -121,28 +131,19 @@ fn handle_user_page_fault(frame: &Frame, fault: Exception, addr: usize) -> Resul
     }
 
     // 优先检查 mmap 预留区域
-    if let Some(mapping) = proc.find_mapping(page_va) {
-        if !mapping.allow(access) {
+    if let Some(entry) = proc.find_page(page_va) {
+        if !entry.allows(access) {
             return Err(FaultError::InvalidAccess);
         }
 
-        // let mut table = pt.lock();
-        if proc.load_mmap_page(page_va, pt) {
+        if proc.lazily_load_page(page_va, pt) {
             return Ok(());
         }
+
         return Err(FaultError::LoadFailed);
     }
 
-    // TODO ELF Lazy Loading（后续实现）
-    // if let Some(segment) = proc.find_lazy_segment(page_va) {
-    //     if !segment.allows(access) {
-    //         return Err(FaultError::InvalidAccess);
-    //     }
-
-    //     return load_elf_page(proc, pt, page_va, &segment).map_err(|_| LoadFailed);
-    // }
-
-    // 尝试 Stack Growth
+    // SPT 中不存在，才尝试增长栈
     if try_grow_stack(frame, fault, addr) {
         return Ok(());
     }

@@ -1,11 +1,15 @@
 use alloc::vec;
+use alloc::vec::Vec;
 use elf_rs::{Elf, ElfFile, ProgramHeaderEntry, ProgramHeaderFlags, ProgramType};
 
 use crate::fs::File;
 use crate::io::prelude::*;
 use crate::mem::pagetable::{PTEFlags, PageTable};
 use crate::mem::palloc::UserPool;
-use crate::mem::{div_round_up, PageAlign, PhysAddr, PG_MASK, PG_SIZE};
+use crate::mem::spt::PageState::Unloaded;
+use crate::mem::spt::{ElfChunk, PageMeta, SptEntry, SupplementalPageTable};
+use crate::mem::{PageAlign, PhysAddr, PG_SIZE};
+use crate::OsError::UserError;
 use crate::{OsError, Result};
 
 #[derive(Debug, Clone, Copy)]
@@ -23,11 +27,15 @@ pub(super) struct ExecInfo {
 /// On success, returns `Ok(usize, usize)`:
 /// - arg0: the entry point of user program
 /// - arg1: the initial sp of user program
-pub(super) fn load_executable(file: &mut File, pagetable: &mut PageTable) -> Result<ExecInfo> {
-    let exec_info = load_elf(file, pagetable)?;
+pub(super) fn load_executable(
+    file: &mut File,
+    pt: &mut PageTable,
+    spt: &mut SupplementalPageTable,
+) -> Result<ExecInfo> {
+    let exec_info = load_elf(file, spt)?;
 
     // Initialize user stack.
-    init_user_stack(pagetable, exec_info.init_sp);
+    init_user_stack(pt, exec_info.init_sp);
 
     // Forbid modifying executable file when running
     file.deny_write();
@@ -36,7 +44,7 @@ pub(super) fn load_executable(file: &mut File, pagetable: &mut PageTable) -> Res
 }
 
 /// Parses the specified executable file and loads segments
-fn load_elf(file: &mut File, pagetable: &mut PageTable) -> Result<ExecInfo> {
+fn load_elf(file: &mut File, spt: &mut SupplementalPageTable) -> Result<ExecInfo> {
     // Ensure cursor is at the beginning
     file.rewind()?;
 
@@ -52,7 +60,7 @@ fn load_elf(file: &mut File, pagetable: &mut PageTable) -> Result<ExecInfo> {
     // load each loadable segment into memory
     elf.program_header_iter()
         .filter(|p| p.ph_type() == ProgramType::LOAD)
-        .for_each(|p| load_segment(&buf, &p, pagetable));
+        .try_for_each(|p| load_segment(&p, spt))?;
 
     Ok(ExecInfo {
         entry_point: elf.elf_header().entry_point() as _,
@@ -61,52 +69,80 @@ fn load_elf(file: &mut File, pagetable: &mut PageTable) -> Result<ExecInfo> {
 }
 
 /// Loads one segment and installs pagetable mappings
-fn load_segment(filebuf: &[u8], phdr: &ProgramHeaderEntry, pagetable: &mut PageTable) {
+fn load_segment(phdr: &ProgramHeaderEntry, pagetable: &mut SupplementalPageTable) -> Result<()> {
     assert_eq!(phdr.ph_type(), ProgramType::LOAD);
 
-    // Meaningful contents of this segment starts from `fileoff`.
+    let seg_va = phdr.vaddr() as usize;
     let fileoff = phdr.offset() as usize;
-    // But we will read and install from `read_pos`.
-    let mut readpos = fileoff & !PG_MASK;
+    let filesz = phdr.filesz() as usize;
+    let memsz = phdr.memsz() as usize;
 
-    // Install flags.
-    let mut leaf_flag = PTEFlags::V | PTEFlags::U | PTEFlags::R;
+    // 该段的权限（U/R/W/X），不包含 V
+    let mut seg_flags = PTEFlags::U | PTEFlags::R;
     if phdr.flags().contains(ProgramHeaderFlags::EXECUTE) {
-        leaf_flag |= PTEFlags::X;
+        seg_flags |= PTEFlags::X;
     }
     if phdr.flags().contains(ProgramHeaderFlags::WRITE) {
-        leaf_flag |= PTEFlags::W;
+        seg_flags |= PTEFlags::W;
     }
 
-    // Install position: `ubase`.
-    let ubase = (phdr.vaddr() as usize) & !PG_MASK;
-    let pageoff = (phdr.vaddr() as usize) & PG_MASK;
-    assert_eq!(fileoff & PG_MASK, pageoff);
+    let file_end = seg_va + filesz;
+    let mem_end = seg_va + memsz;
 
-    // How many pages need to be allocated
-    let pages = div_round_up(pageoff + phdr.memsz() as usize, PG_SIZE);
-    let mut readbytes = phdr.filesz() as usize + pageoff;
+    let mut va = seg_va.floor();
 
-    // Allocate & map pages
-    for p in 0..pages {
-        let buf = unsafe { UserPool::alloc_pages(1) };
-        let page = unsafe { (buf as *mut [u8; PG_SIZE]).as_mut().unwrap() };
+    while va < mem_end {
+        let next_va = va + PG_SIZE;
 
-        // Read `readsz` bytes, fill remaining bytes with 0.
-        let readsz = readbytes.min(PG_SIZE);
-        page[..readsz].copy_from_slice(&filebuf[readpos..readpos + readsz]);
-        page[readsz..].fill(0);
+        // 当前页面中真正需要从文件读取的区间
+        let begin = seg_va.max(va);
+        let end = file_end.min(next_va);
 
-        // The installed page will be freed when pagetable drops, which happens
-        // when user process exits. No manual resource collect is required.
-        let uaddr = ubase + p * PG_SIZE;
-        pagetable.map(buf.into(), uaddr, 1, leaf_flag);
+        match pagetable.get_mut(va) {
+            Some(entry) => {
+                // 同一页需要合并权限
+                entry.flags |= seg_flags;
 
-        readbytes -= readsz;
-        readpos += readsz;
+                match &mut entry.meta {
+                    PageMeta::Elf { chunks } => {
+                        if begin < end {
+                            chunks.push(ElfChunk {
+                                file_offset: fileoff + (begin - seg_va),
+                                page_offset: begin - va,
+                                len: end - begin,
+                            });
+                        }
+                    }
+                    _ => {
+                        // 与非 ELF 页面冲突，应报错
+                        return Err(OsError::UnknownFormat);
+                    }
+                }
+            }
+            None => {
+                let mut chunks = Vec::new();
+                if begin < end {
+                    chunks.push(ElfChunk {
+                        file_offset: fileoff + (begin - seg_va),
+                        page_offset: begin - va,
+                        len: end - begin,
+                    });
+                }
+                let entry = SptEntry {
+                    meta: PageMeta::Elf { chunks },
+                    state: Unloaded,
+                    flags: seg_flags,
+                };
+                if !pagetable.insert(va, entry) {
+                    return Err(UserError);
+                }
+            }
+        }
+
+        va = next_va;
     }
 
-    assert_eq!(readbytes, 0);
+    Ok(())
 }
 
 /// Initializes the user stack.
